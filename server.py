@@ -1,0 +1,741 @@
+import asyncio
+import json
+import random
+import time
+import ssl
+import sys
+import os
+import urllib.request
+from datetime import datetime, timezone
+import websockets
+
+# Try using uvloop policy for high performance hosted event loop
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    pass
+
+# Set up unverified SSL context for macOS python urllib issues
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# Try importing psycopg2 for PostgreSQL support in production
+try:
+    import psycopg2
+    HAS_POSTGRES = True
+except ImportError:
+    HAS_POSTGRES = False
+
+class DatabaseManager:
+    def __init__(self, log_fn):
+        self.log_fn = log_fn
+        self.db_url = os.environ.get("DATABASE_URL")
+        self.conn = None
+        self.is_postgres = False
+        
+        self.connect()
+        self.create_tables()
+        
+    def connect(self):
+        if self.db_url:
+            try:
+                url = self.db_url
+                if url.startswith("postgres://"):
+                    url = url.replace("postgres://", "postgresql://", 1)
+                
+                if HAS_POSTGRES:
+                    self.conn = psycopg2.connect(url)
+                    self.conn.autocommit = True
+                    self.is_postgres = True
+                    self.log_fn("Connected to PostgreSQL Database.")
+                    return
+                else:
+                    self.log_fn("psycopg2 not installed. Falling back to SQLite.")
+            except Exception as e:
+                self.log_fn(f"Failed to connect to PostgreSQL: {e}. Falling back to SQLite.")
+                
+        # Default to SQLite
+        try:
+            self.conn = sqlite3.connect("poly_bot.db", check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            self.log_fn("Connected to Local SQLite Database (poly_bot.db).")
+        except Exception as e:
+            self.log_fn(f"Failed to initialize SQLite Database: {e}")
+
+    def create_tables(self):
+        if not self.conn:
+            return
+        
+        cursor = self.conn.cursor()
+        
+        trades_sql = """
+        CREATE TABLE IF NOT EXISTS trades (
+            id VARCHAR(64) PRIMARY KEY,
+            timestamp_utc TIMESTAMP,
+            market_slug VARCHAR(128),
+            strategy VARCHAR(64),
+            outcome_bet VARCHAR(32),
+            entry_price DECIMAL(10, 4),
+            position_size DECIMAL(10, 4),
+            gas_fee_gwei DECIMAL(10, 2),
+            pnl_status VARCHAR(32),
+            resolved_at TIMESTAMP
+        );
+        """
+        
+        stats_sql = """
+        CREATE TABLE IF NOT EXISTS daily_stats (
+            date_utc VARCHAR(32) PRIMARY KEY,
+            wallet_balance DECIMAL(12, 4),
+            total_trades INTEGER,
+            win_rate DECIMAL(10, 4),
+            timestamp_utc TIMESTAMP
+        );
+        """
+        
+        try:
+            cursor.execute(trades_sql)
+            cursor.execute(stats_sql)
+            if not self.is_postgres:
+                self.conn.commit()
+        except Exception as e:
+            self.log_fn(f"Failed to create database tables: {e}")
+            
+    def execute(self, query, params=None):
+        if not self.conn:
+            return None
+        
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(query, params or ())
+            if not self.is_postgres:
+                self.conn.commit()
+            return cursor
+        except Exception as e:
+            self.log_fn(f"Database query error: {query} -> {e}")
+            return None
+
+    def insert_trade(self, id_, timestamp, slug, strategy, outcome, price, size, gas, status):
+        query = """
+        INSERT INTO trades (id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        """
+        if self.is_postgres:
+            query = query.replace("?", "%s")
+        self.execute(query, (id_, timestamp, slug, strategy, outcome, price, size, gas, status))
+        
+    def resolve_trade(self, id_, status, resolved_at):
+        query = """
+        UPDATE trades SET pnl_status = ?, resolved_at = ? WHERE id = ?
+        """
+        if self.is_postgres:
+            query = query.replace("?", "%s")
+            self.execute(query, (status, resolved_at, id_))
+        else:
+            self.execute(query, (status, resolved_at, id_))
+
+    def load_recent_trades(self, limit=50):
+        query = f"SELECT * FROM trades ORDER BY timestamp_utc DESC LIMIT {limit}"
+        cursor = self.execute(query)
+        if not cursor:
+            return []
+        
+        trades = []
+        rows = cursor.fetchall()
+        for r in rows:
+            if self.is_postgres:
+                trades.append({
+                    "id": r[0],
+                    "timestamp_utc": r[1].strftime("%Y-%m-%dT%H:%M:%S.000Z") if hasattr(r[1], "strftime") else str(r[1]),
+                    "market_slug": r[2],
+                    "strategy": r[3],
+                    "outcome_bet": r[4],
+                    "entry_price": float(r[5]),
+                    "position_size": float(r[6]),
+                    "gas_fee_gwei": float(r[7]),
+                    "pnl_status": r[8],
+                    "resolved_at": r[9]
+                })
+            else:
+                trades.append({
+                    "id": r["id"],
+                    "timestamp_utc": r["timestamp_utc"],
+                    "market_slug": r["market_slug"],
+                    "strategy": r["strategy"],
+                    "outcome_bet": r["outcome_bet"],
+                    "entry_price": float(r["entry_price"]),
+                    "position_size": float(r["position_size"]),
+                    "gas_fee_gwei": float(r["gas_fee_gwei"]),
+                    "pnl_status": r["pnl_status"],
+                    "resolved_at": r["resolved_at"]
+                })
+        return trades[::-1]
+        
+    def save_daily_stats(self, date_str, balance, total_trades, win_rate, timestamp):
+        check_query = "SELECT date_utc FROM daily_stats WHERE date_utc = ?"
+        if self.is_postgres:
+            check_query = check_query.replace("?", "%s")
+        
+        cursor = self.execute(check_query, (date_str,))
+        if cursor and cursor.fetchone():
+            update_query = """
+            UPDATE daily_stats SET wallet_balance = ?, total_trades = ?, win_rate = ?, timestamp_utc = ?
+            WHERE date_utc = ?
+            """
+            if self.is_postgres:
+                update_query = update_query.replace("?", "%s")
+                self.execute(update_query, (balance, total_trades, win_rate, timestamp, date_str))
+            else:
+                self.execute(update_query, (balance, total_trades, win_rate, timestamp, date_str))
+        else:
+            insert_query = """
+            INSERT INTO daily_stats (date_utc, wallet_balance, total_trades, win_rate, timestamp_utc)
+            VALUES (?, ?, ?, ?, ?)
+            """
+            if self.is_postgres:
+                insert_query = insert_query.replace("?", "%s")
+            self.execute(insert_query, (date_str, balance, total_trades, win_rate, timestamp))
+
+import sqlite3
+
+class TradingEngine:
+    def __init__(self):
+        # Wallet and performance stats
+        self.initial_wallet = 1420.55
+        self.wallet = self.initial_wallet
+        self.net_pnl_usdc = 0.0
+        self.net_pnl_pct = 0.0
+        self.wins = 0
+        self.losses = 0
+        self.arbitrage_wins = 0
+        self.penny_wins = 0
+        self.total_trades_count = 0
+        self.resolved_trades_count = 0
+        
+        # Configuration
+        self.max_slippage = 0.01
+        
+        # Live market tracking
+        self.spot_prices = {"BTC": 67250.0, "ETH": 3480.0, "SOL": 142.50, "XRP": 0.58, "BNB": 585.0}
+        self.price_decimals = {"BTC": 1, "ETH": 2, "SOL": 2, "XRP": 4, "BNB": 2}
+        self.active_markets = {}  # symbol -> market_details
+        
+        # Activity and logs
+        self.activity_log = []
+        self.system_logs = []
+        
+        self.status = "RUNNING"
+        self.latency_ms = 1.4
+        self.rpc_node_health = "HEALTHY"
+        self.clients = set()
+        
+        # State locks and limit fallback orders
+        self.market_locks = {}           # slug -> status (e.g. LOCKED_STRATEGY_A)
+        self.resting_limit_orders = []    # list of active resting orders
+        self.priority_gas_gwei = 65      # Polygon priority gas fee Gwei
+        self.matic_price = 0.55          # Matic price in USDC
+        
+        self.add_system_log("POLY-BOT trading engine initialized.")
+        
+        # Database Integration
+        self.db = DatabaseManager(self.add_system_log)
+        self.rehydrate_state()
+
+    def rehydrate_state(self):
+        recent_trades = self.db.load_recent_trades(50)
+        self.add_system_log(f"Rehydrating state: loaded {len(recent_trades)} historical trades from database.")
+        
+        for t in recent_trades:
+            trade_obj = {
+                "id": t["id"],
+                "datetime_utc": t["timestamp_utc"],
+                "slug": t["market_slug"],
+                "outcome": t["outcome_bet"],
+                "price": t["entry_price"],
+                "size": t["position_size"],
+                "status": t["pnl_status"],
+                "tx_hash": t["id"],
+                "strategy": t["strategy"]
+            }
+            self.activity_log.append(trade_obj)
+            
+            if t["pnl_status"] != "PENDING":
+                self.resolved_trades_count += 1
+                self.total_trades_count += 1
+                
+                cost = t["position_size"] * t["entry_price"]
+                if t["pnl_status"] == "WIN":
+                    self.wins += 1
+                    if "Arbitrage" in t["strategy"]:
+                        self.arbitrage_wins += 1
+                    else:
+                        self.penny_wins += 1
+                    self.wallet += (t["position_size"] - cost)
+                    self.net_pnl_usdc += (t["position_size"] - cost)
+                else:
+                    self.losses += 1
+                    self.wallet -= cost
+                    self.net_pnl_usdc -= cost
+                    
+        if len(recent_trades) > 0:
+            self.net_pnl_pct = (self.net_pnl_usdc / self.initial_wallet) * 100
+            self.add_system_log(f"State rehydrated. Current Wallet Balance: ${self.wallet:.2f} USDC | Wins: {self.wins} | Losses: {self.losses}")
+
+    def add_activity(self, slug, outcome, price, size, status, tx_hash=None):
+        if not tx_hash:
+            tx_hash = f"0x{random.randbytes(32).hex()}"
+        
+        trade = {
+            "datetime_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "slug": slug,
+            "outcome": outcome,
+            "price": price,
+            "size": size,
+            "status": status,
+            "tx_hash": tx_hash
+        }
+        self.activity_log.append(trade)
+        if len(self.activity_log) > 50:
+            self.activity_log.pop(0)
+        return trade
+
+    def add_system_log(self, msg):
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        log_line = f"[{timestamp}] {msg}"
+        self.system_logs.append(log_line)
+        if len(self.system_logs) > 100:
+            self.system_logs.pop(0)
+        print(log_line)
+
+    def get_state(self):
+        # Build state dict to stream to frontend
+        return {
+            "wallet": round(self.wallet, 2),
+            "net_pnl_usdc": round(self.net_pnl_usdc, 2),
+            "net_pnl_pct": round(self.net_pnl_pct, 2),
+            "wins": self.wins,
+            "losses": self.losses,
+            "arbitrage_wins": self.arbitrage_wins,
+            "penny_wins": self.penny_wins,
+            "total_trades_count": self.total_trades_count,
+            "resolved_trades_count": self.resolved_trades_count,
+            "spot_prices": self.spot_prices,
+            "active_markets": list(self.active_markets.values()),
+            "activity_log": self.activity_log,
+            "system_logs": self.system_logs[-20:],
+            "status": self.status,
+            "latency_ms": round(self.latency_ms, 2),
+            "rpc_node_health": self.rpc_node_health,
+            "market_locks": self.market_locks,
+            "resting_limit_orders": self.resting_limit_orders,
+            "priority_gas_gwei": self.priority_gas_gwei,
+            "matic_price": self.matic_price
+        }
+
+    async def broadcast(self):
+        if not self.clients:
+            return
+        state_str = json.dumps(self.get_state())
+        disconnected = set()
+        for client in list(self.clients):
+            try:
+                await client.send(state_str)
+            except Exception:
+                disconnected.add(client)
+        for client in disconnected:
+            if client in self.clients:
+                self.clients.remove(client)
+
+    async def handle_ws(self, websocket, path=None):
+        self.clients.add(websocket)
+        self.add_system_log(f"Frontend client connected. Total clients: {len(self.clients)}")
+        try:
+            async for message in websocket:
+                # Receive commands from frontend
+                data = json.loads(message)
+                action = data.get("action")
+                if action == "toggle_status":
+                    self.status = "RUNNING" if self.status == "PAUSED" else "PAUSED"
+                    self.add_system_log(f"Engine status changed to: {self.status}")
+                elif action == "trigger_gas_bump":
+                    self.latency_ms = max(0.5, self.latency_ms - 0.3)
+                    self.add_system_log("Manual gas priority bump triggered. Network latency optimized.")
+        except Exception as e:
+            pass
+        finally:
+            self.clients.remove(websocket)
+            self.add_system_log("Frontend client disconnected.")
+
+    async def binance_price_feed(self):
+        """Streams prices from Binance Spot WebSocket with auto-reconnection and heartbeats."""
+        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
+        url = "wss://stream.binance.com:9443/ws"
+        
+        while True:
+            try:
+                self.add_system_log("Connecting to Binance Spot WebSocket...")
+                ssl_context = ssl._create_unverified_context()
+                async with websockets.connect(url, ssl=ssl_context) as ws:
+                    # Subscribe to tickers
+                    sub_msg = {
+                        "method": "SUBSCRIBE",
+                        "params": [f"{s.lower()}@ticker" for s in symbols],
+                        "id": 1
+                    }
+                    await ws.send(json.dumps(sub_msg))
+                    self.add_system_log("Subscribed to Binance price feeds.")
+                    
+                    while True:
+                        try:
+                            message = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                        except asyncio.TimeoutError:
+                            self.add_system_log("Binance WebSocket read timeout (10s). Triggering reconnect...")
+                            break
+                            
+                        data = json.loads(message)
+                        if "s" in data and "c" in data:
+                            ticker = data["s"]
+                            price = float(data["c"])
+                            symbol = ticker.replace("USDT", "")
+                            self.spot_prices[symbol] = price
+            except Exception as e:
+                self.add_system_log(f"Binance WebSocket error: {e}. Reconnecting in 1s...")
+                await asyncio.sleep(1)
+
+    def fetch_market_details(self, slug):
+        """Queries the Polymarket Gamma API to get details of a slug."""
+        try:
+            url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            res = urllib.request.urlopen(req).read()
+            data = json.loads(res)
+            if len(data) > 0:
+                return data[0]
+        except Exception as e:
+            pass
+        return None
+
+    async def market_management_loop(self):
+        """Periodically syncs active 5M/15M markets and resolves rounds."""
+        symbols = ["BTC", "ETH", "SOL", "XRP", "BNB"]
+        
+        while True:
+            if self.status != "RUNNING":
+                await asyncio.sleep(1)
+                continue
+                
+            t = int(time.time())
+            t_rounded_5m = t - (t % 300)
+            t_rounded_15m = t - (t % 900)
+            
+            # 1. Update active 5m markets
+            for symbol in symbols:
+                # We expect a market to exist for the current 5m interval
+                # Active round starts at t_rounded_5m, closes at t_rounded_5m + 300
+                slug_5m = f"{symbol.lower()}-updown-5m-{t_rounded_5m}"
+                close_time = t_rounded_5m + 300
+                time_remaining = close_time - t
+                
+                # Fetch details if not already loaded
+                if slug_5m not in self.active_markets:
+                    self.add_system_log(f"Syncing active contract details for: {slug_5m}")
+                    details = await asyncio.to_thread(self.fetch_market_details, slug_5m)
+                    
+                    if details:
+                        # Record the strike price (the spot price at the start of the round)
+                        # We fall back to current spot price if not available
+                        strike = self.spot_prices[symbol]
+                        self.active_markets[slug_5m] = {
+                            "symbol": symbol,
+                            "slug": slug_5m,
+                            "type": "5M",
+                            "start_time": t_rounded_5m,
+                            "close_time": close_time,
+                            "strike_price": strike,
+                            "id": details.get("id"),
+                            "clobTokenIds": json.loads(details.get("clobTokenIds", "[]")),
+                            "conditionId": details.get("conditionId"),
+                            "last_evaluated": 0,
+                            "resolved": False
+                        }
+                        self.add_system_log(f"Market Active: {slug_5m} | Strike Price Set: ${strike:,.2f}")
+                    else:
+                        # Fallback mock details if the live round isn't created on Gamma API yet
+                        # (Helps keep the engine alive offline or during API delay)
+                        strike = self.spot_prices[symbol]
+                        self.active_markets[slug_5m] = {
+                            "symbol": symbol,
+                            "slug": slug_5m,
+                            "type": "5M",
+                            "start_time": t_rounded_5m,
+                            "close_time": close_time,
+                            "strike_price": strike,
+                            "id": f"mock-{t_rounded_5m}",
+                            "clobTokenIds": [f"yes-{t_rounded_5m}", f"no-{t_rounded_5m}"],
+                            "conditionId": f"cond-{t_rounded_5m}",
+                            "last_evaluated": 0,
+                            "resolved": False
+                        }
+
+            # 2. Evaluate execution triggers (-5s to +2s window)
+            for slug, market in list(self.active_markets.items()):
+                if market["resolved"]:
+                    continue
+                    
+                time_remaining = market["close_time"] - t
+                symbol = market["symbol"]
+                spot = self.spot_prices[symbol]
+                strike = market["strike_price"]
+                
+                # Dynamic contract pricing estimation based on spot vs strike
+                # Difference between spot and strike
+                delta = spot - strike
+                
+                # Estimate contract prices: YES is Up, NO is Down
+                # If delta is positive and large, YES is high (0.95-0.99), NO is low (0.01-0.05)
+                # If delta is negative and large, NO is high (0.95-0.99), YES is low (0.01-0.05)
+                # Around delta = 0, they hover around 0.50.
+                volatility_factor = 2.0 if symbol in ["BTC", "BNB"] else 0.1
+                val = -delta / volatility_factor
+                val = max(-50.0, min(50.0, val))
+                price_yes = 1 / (1 + 2.718 ** val)
+                price_yes = max(0.01, min(0.99, price_yes))
+                price_no = 1 - price_yes
+                
+                # Add price fields to active market info for UI display
+                market["time_remaining"] = time_remaining
+                market["price_yes"] = round(price_yes, 2)
+                market["price_no"] = round(price_no, 2)
+                
+                # Simulate order book bid/ask depth
+                market["order_book"] = {
+                    "YES": {
+                        "bids": [[round(price_yes - 0.01 * j, 2), random.randint(100, 1000)] for j in range(1, 4)],
+                        "asks": [[round(price_yes + 0.01 * j, 2), random.randint(100, 1000)] for j in range(1, 4)]
+                    },
+                    "NO": {
+                        "bids": [[round(price_no - 0.01 * j, 2), random.randint(100, 1000)] for j in range(1, 4)],
+                        "asks": [[round(price_no + 0.01 * j, 2), random.randint(100, 1000)] for j in range(1, 4)]
+                    }
+                }
+
+                # Evaluate active resting limit orders for this slug
+                for order in list(self.resting_limit_orders):
+                    if order["slug"] == slug:
+                        is_fill = False
+                        if order["outcome"] == "Up" and price_yes <= order["price"]:
+                            is_fill = True
+                        elif order["outcome"] == "Down" and price_no <= order["price"]:
+                            is_fill = True
+                            
+                        if is_fill:
+                            cost = order["size"] * order["price"]
+                            if self.wallet >= cost:
+                                self.wallet -= cost
+                                self.total_trades_count += 1
+                                trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "PENDING", order["tx_hash"])
+                                trade["strategy"] = order["strategy"]
+                                
+                                # Insert filled limit order into database
+                                self.db.insert_trade(
+                                    order["tx_hash"], 
+                                    trade["datetime_utc"], 
+                                    slug, 
+                                    order["strategy"], 
+                                    order["outcome"], 
+                                    order["price"], 
+                                    order["size"], 
+                                    self.priority_gas_gwei, 
+                                    "PENDING"
+                                )
+                                self.add_system_log(f"[Limit Filled] Limit order for {order['outcome']} filled on {slug} @ ${order['price']:.3f}")
+                            self.resting_limit_orders.remove(order)
+
+                # Evaluate execution triggers
+                # Window: final 5 seconds before close
+                if -5 <= time_remaining <= 0 and market["last_evaluated"] != t:
+                    market["last_evaluated"] = t
+                    
+                    # Check YES (Up)
+                    if 0.95 <= price_yes <= 0.99:
+                        self.trigger_paper_trade(market, "Up", price_yes, "Strategy A (Arbitrage Lock)")
+                    elif 0.01 <= price_yes <= 0.05:
+                        if self.market_locks.get(slug) != "LOCKED_STRATEGY_A":
+                            self.trigger_paper_trade(market, "Up", price_yes, "Strategy B (Penny Sweep)")
+                        
+                    # Check NO (Down)
+                    if 0.95 <= price_no <= 0.99:
+                        self.trigger_paper_trade(market, "Down", price_no, "Strategy A (Arbitrage Lock)")
+                    elif 0.01 <= price_no <= 0.05:
+                        if self.market_locks.get(slug) != "LOCKED_STRATEGY_A":
+                            self.trigger_paper_trade(market, "Down", price_no, "Strategy B (Penny Sweep)")
+
+                # 3. Post-Close Settlement Resolution (+2s grace period exploit)
+                # Polymarket oracle settlement delay allows scanning/executing for up to 2s post-close
+                if time_remaining < -2:
+                    # Final spot tick resolution
+                    winner = "Up" if spot >= strike else "Down"
+                    
+                    # Resolve active simulated positions
+                    resolved_any = False
+                    for trade in self.activity_log:
+                        if trade["slug"] == slug and trade["status"] == "PENDING":
+                            resolved_any = True
+                            is_win = (trade["outcome"] == winner)
+                            if is_win:
+                                trade["status"] = "WIN"
+                                self.wins += 1
+                                if "Arbitrage" in trade.get("strategy", ""):
+                                    self.arbitrage_wins += 1
+                                else:
+                                    self.penny_wins += 1
+                                payout = trade["size"]
+                                self.wallet += payout
+                                self.net_pnl_usdc += (payout - (trade["size"] * trade["price"]))
+                            else:
+                                trade["status"] = "LOSS"
+                                self.losses += 1
+                                self.net_pnl_usdc -= (trade["size"] * trade["price"])
+                            
+                            self.resolved_trades_count += 1
+                            self.net_pnl_pct = (self.net_pnl_usdc / self.initial_wallet) * 100
+                            self.add_system_log(f"Round Settled: {slug} | Winner: {winner} | Trade: {trade['status']}")
+                            
+                            # Update database
+                            resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                            self.db.resolve_trade(trade["tx_hash"], trade["status"], resolved_time)
+                    
+                    if resolved_any:
+                        self.add_system_log(f"Cleaned up resolved contract state for: {slug}")
+                        # Save daily stats
+                        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                        win_rate = (self.wins / (self.wins + self.losses) * 100) if (self.wins + self.losses) > 0 else 0.0
+                        self.db.save_daily_stats(today_str, self.wallet, self.wins + self.losses, win_rate, now_str)
+                    
+                    # Clean up locks and limit orders
+                    if slug in self.market_locks:
+                        self.market_locks.pop(slug)
+                    self.resting_limit_orders = [o for o in self.resting_limit_orders if o["slug"] != slug]
+                    
+                    # Remove from active listing
+                    market["resolved"] = True
+                    self.active_markets.pop(slug)
+            
+            # Broadcast state to frontend
+            await self.broadcast()
+            await asyncio.sleep(0.1)
+
+    def trigger_paper_trade(self, market, outcome, price, strategy_name):
+        """Simulates order submission, gas priority logic, slippage guards, and fill."""
+        slug = market["slug"]
+        
+        # Position sizing (based on historical average sizing)
+        if "Arbitrage" in strategy_name:
+            size_usdc = random.uniform(25.0, 45.0)
+        else:
+            # Adaptive sizing: scale down size based on remaining time and contract price to prevent large losses
+            # Lower price (lower probability) -> smaller USDC size to minimize exposure
+            time_factor = max(0.2, min(1.0, market.get("time_remaining", 5) / 5.0))
+            base_size = random.uniform(0.10, 0.25)
+            size_usdc = base_size * (price / 0.05) * time_factor
+            # Cap to keep it extremely tight and optimized
+            size_usdc = max(0.05, min(0.30, size_usdc))
+            
+        shares = size_usdc / price
+        
+        # Gas priority simulation
+        priority_gas_gwei = self.priority_gas_gwei
+        # Estimated Gas Cost = Gas Limit (150,000) * Price (Gwei * 1e-9) * MATIC price (0.55)
+        gas_cost_usdc = 150000 * (priority_gas_gwei * 1e-9) * self.matic_price
+        
+        # Expected Net Profit check
+        expected_net_profit = (shares * (1.00 - price)) - gas_cost_usdc
+        
+        if expected_net_profit <= 0.05:
+            self.add_system_log(f"[Blocked] Trade on {slug} skipped: Expected profit below gas-adjusted threshold.")
+            return
+            
+        # Slippage check
+        simulated_slippage = random.uniform(0.0, 0.015)
+        if simulated_slippage > self.max_slippage:
+            self.add_system_log(f"[Blocked] Trade on {slug} blocked: Slippage ({simulated_slippage:.3f}) exceeds limit.")
+            self.add_system_log(f"Slippage block fallback: Posting resting limit order at ${price:.3f} on {slug}")
+            
+            # Post resting limit order
+            tx_hash = f"0x{random.randbytes(32).hex()}"
+            self.resting_limit_orders.append({
+                "slug": slug,
+                "outcome": outcome,
+                "price": price,
+                "size": shares,
+                "strategy": strategy_name,
+                "tx_hash": tx_hash
+            })
+            
+            # Lock the market slug if it's an Arbitrage strategy to prevent Strategy B triggers
+            if "Arbitrage" in strategy_name:
+                self.market_locks[slug] = "LOCKED_STRATEGY_A"
+            return
+
+        self.add_system_log(f"t-{abs(market['time_remaining'])}s: {strategy_name} triggered on {slug} for {outcome} @ ${price:.3f}")
+        self.add_system_log(f"Gas priority configured: {priority_gas_gwei} Gwei. Simulating block inclusion...")
+        
+        # Verify wallet capacity
+        if self.wallet < size_usdc:
+            self.add_system_log("Order rejected: Insufficient USDC balance.")
+            return
+            
+        # Deduct cost from wallet
+        self.wallet -= size_usdc
+        self.total_trades_count += 1
+        
+        # Mutual Exclusion State Machine Lock
+        if "Arbitrage" in strategy_name:
+            self.market_locks[slug] = "LOCKED_STRATEGY_A"
+        
+        # Record trade as PENDING (waiting for close tick resolution)
+        trade = self.add_activity(slug, outcome, price, shares, "PENDING")
+        trade["strategy"] = strategy_name
+        
+        # Insert trade into database
+        self.db.insert_trade(
+            trade["tx_hash"], 
+            trade["datetime_utc"], 
+            slug, 
+            strategy_name, 
+            outcome, 
+            price, 
+            shares, 
+            priority_gas_gwei, 
+            "PENDING"
+        )
+        
+        self.add_system_log(f"Order filled successfully. Tx: {trade['tx_hash'][:10]}... | Position: {shares:.1f} shares")
+
+    async def latency_jitter_simulation(self):
+        """Simulates network jitter of WebSocket connectivity and gas fluctuations."""
+        while True:
+            self.latency_ms = max(0.5, min(25.0, self.latency_ms + random.uniform(-0.4, 0.5)))
+            self.priority_gas_gwei = max(35, min(180, self.priority_gas_gwei + random.randint(-8, 10)))
+            await asyncio.sleep(2)
+
+async def main():
+    engine = TradingEngine()
+    
+    # Start background threads/tasks
+    asyncio.create_task(engine.binance_price_feed())
+    asyncio.create_task(engine.market_management_loop())
+    asyncio.create_task(engine.latency_jitter_simulation())
+    
+    # Start Local WebSocket Server
+    port = 8000
+    engine.add_system_log(f"Starting Local WebSocket Server on ws://localhost:{port}")
+    async with websockets.serve(engine.handle_ws, "0.0.0.0", port):
+        await asyncio.Event().wait()  # keep running
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nPOLY-BOT Server Terminated.")

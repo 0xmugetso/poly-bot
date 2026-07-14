@@ -1,0 +1,23 @@
+# Node dependencies
+node_modules/
+npm-cache/
+
+# Build outputs
+dist/
+
+# SQLite databases
+*.db
+*.db-journal
+*.db-wal
+
+# Python caches and virtualenvs
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# IDE files
+.vscode/
+.idea/
+.DS_Store
