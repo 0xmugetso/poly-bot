@@ -206,13 +206,13 @@ export default function App() {
   const filteredLogs = systemLogs.filter(log => {
     if (logFilter === "ALL") return true;
     if (logFilter === "TRADES") {
-      return log.includes("triggered") || log.includes("filled") || log.includes("Settled") || log.includes("Filled");
+      return log.includes("triggered") || log.includes("filled") || log.includes("Settled") || log.includes("Filled") || log.includes("LIMIT");
     }
     if (logFilter === "BLOCKED") {
       return log.includes("[Blocked]") || log.includes("blocked") || log.includes("skipped");
     }
     if (logFilter === "SYSTEM") {
-      return !log.includes("triggered") && !log.includes("filled") && !log.includes("Settled") && !log.includes("[Blocked]") && !log.includes("blocked") && !log.includes("skipped") && !log.includes("Filled");
+      return !log.includes("triggered") && !log.includes("filled") && !log.includes("Settled") && !log.includes("[Blocked]") && !log.includes("blocked") && !log.includes("skipped") && !log.includes("Filled") && !log.includes("LIMIT");
     }
     return true;
   });
@@ -328,15 +328,12 @@ export default function App() {
           <div className="flex flex-col gap-1">
             <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Strategy Split</span>
             <span className="text-xl font-mono-val font-bold text-slate-200">
-              {arbitrageWins + pennyWins > 0 
-                ? `${Math.round((arbitrageWins / (arbitrageWins + pennyWins)) * 100)}% / ${Math.round((pennyWins / (arbitrageWins + pennyWins)) * 100)}%`
-                : "100% / 0%"
-              }
+              0% / 100%
             </span>
           </div>
           <div className="flex flex-col items-end text-[10px] font-mono text-slate-400 uppercase">
-            <span>Arb: {arbitrageWins}</span>
-            <span>Penny: {pennyWins}</span>
+            <span>Arb: 0</span>
+            <span>Penny: {pennyWins + arbitrageWins}</span>
           </div>
         </div>
       </section>
@@ -561,7 +558,9 @@ export default function App() {
           <div ref={consoleContainerRef} className="flex-grow p-4 overflow-y-auto font-mono text-xs leading-relaxed space-y-1.5 flex flex-col justify-start">
             {filteredLogs.map((log, idx) => {
               let styleClass = "text-slate-400";
-              if (log.includes("Arbitrage window") || log.includes("Executing BUY")) styleClass = "text-[#10B981] font-bold";
+              if (log.includes("[MAKER LIMIT POSTED]")) styleClass = "text-amber-400 font-medium";
+              else if (log.includes("[MAKER LIMIT FILLED]")) styleClass = "text-emerald-400 font-bold";
+              else if (log.includes("Arbitrage window") || log.includes("Executing BUY")) styleClass = "text-[#10B981] font-bold";
               else if (log.includes("WIN") || log.includes("filled") || log.includes("[Limit Filled]")) styleClass = "text-emerald-400 font-semibold";
               else if (log.includes("LOSS") || log.includes("blocked") || log.includes("exceeds") || log.includes("[Blocked]")) styleClass = "text-rose-400";
               else if (log.includes("Round Settled") || log.includes("Market Active") || log.includes("LOCKED")) styleClass = "text-slate-200 font-semibold";

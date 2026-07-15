@@ -98,8 +98,16 @@ class DatabaseManager:
             cursor.execute(stats_sql)
             if not self.is_postgres:
                 self.conn.commit()
+            
+            # Mainnet Purge: Clean up mock records on launch under production mode
+            if os.environ.get("ENV") == "LIVE_MAINNET_TRADING":
+                cursor.execute("DELETE FROM trades;")
+                cursor.execute("DELETE FROM daily_stats;")
+                if not self.is_postgres:
+                    self.conn.commit()
+                self.log_fn("Mainnet mode active: Old simulation databases purged successfully.")
         except Exception as e:
-            self.log_fn(f"Failed to create database tables: {e}")
+            self.log_fn(f"Failed to create/purge database tables: {e}")
             
     def execute(self, query, params=None):
         if not self.conn:
@@ -214,6 +222,10 @@ class TradingEngine:
         
         # Configuration
         self.max_slippage = 0.01
+        self.max_position_size_usdc = float(os.environ.get("MAX_POSITION_SIZE_USDC", 0.10))
+        self.max_simultaneous_trades = int(os.environ.get("MAX_SIMULTANEOUS_TRADES", 2))
+        self.min_profit_threshold_usdc = float(os.environ.get("MIN_PROFIT_THRESHOLD_USDC", 0.02))
+        self.env = os.environ.get("ENV", "SIMULATION")
         
         # Live market tracking
         self.spot_prices = {"BTC": 67250.0, "ETH": 3480.0, "SOL": 142.50, "XRP": 0.58, "BNB": 585.0}
@@ -545,42 +557,50 @@ class TradingEngine:
                             if self.wallet >= cost:
                                 self.wallet -= cost
                                 self.total_trades_count += 1
-                                trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "PENDING", order["tx_hash"])
-                                trade["strategy"] = order["strategy"]
                                 
-                                # Insert filled limit order into database
-                                self.db.insert_trade(
-                                    order["tx_hash"], 
-                                    trade["datetime_utc"], 
-                                    slug, 
-                                    order["strategy"], 
-                                    order["outcome"], 
-                                    order["price"], 
-                                    order["size"], 
-                                    self.priority_gas_gwei, 
-                                    "PENDING"
-                                )
-                                self.add_system_log(f"[Limit Filled] Limit order for {order['outcome']} filled on {slug} @ ${order['price']:.3f}")
+                                # Re-hydrate or update the LIMIT_POSTED activity log item to PENDING
+                                matched_trade = None
+                                for trade in self.activity_log:
+                                    if trade["tx_hash"] == order["tx_hash"]:
+                                        matched_trade = trade
+                                        break
+                                
+                                if matched_trade:
+                                    matched_trade["status"] = "PENDING"
+                                    self.db.resolve_trade(order["tx_hash"], "PENDING", None)
+                                else:
+                                    trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "PENDING", order["tx_hash"])
+                                    trade["strategy"] = order["strategy"]
+                                    self.db.insert_trade(
+                                        order["tx_hash"], 
+                                        trade["datetime_utc"], 
+                                        slug, 
+                                        order["strategy"], 
+                                        order["outcome"], 
+                                        order["price"], 
+                                        order["size"], 
+                                        self.priority_gas_gwei, 
+                                        "PENDING"
+                                    )
+                                
+                                self.add_system_log(f"[MAKER LIMIT FILLED] Limit order for {order['outcome']} filled on {slug} @ ${order['price']:.3f}")
                             self.resting_limit_orders.remove(order)
 
                 # Evaluate execution triggers
-                # Window: final 5 seconds before close
-                if -5 <= time_remaining <= 0 and market["last_evaluated"] != t:
+                # Window: final -5 seconds to +2 seconds epoch boundaries
+                if -5 <= time_remaining <= 2 and market["last_evaluated"] != t:
                     market["last_evaluated"] = t
                     
+                    # Strategy A is hard deprecated.
+                    # We evaluate YES/NO only for Strategy B (Penny Sweeps) targeting $0.01 to $0.04
+                    
                     # Check YES (Up)
-                    if 0.95 <= price_yes <= 0.99:
-                        self.trigger_paper_trade(market, "Up", price_yes, "Strategy A (Arbitrage Lock)")
-                    elif 0.01 <= price_yes <= 0.05:
-                        if self.market_locks.get(slug) != "LOCKED_STRATEGY_A":
-                            self.trigger_paper_trade(market, "Up", price_yes, "Strategy B (Penny Sweep)")
+                    if 0.01 <= price_yes <= 0.04:
+                        self.post_maker_limit_order(market, "Up", price_yes, "Strategy B (Penny Sweep)")
                         
                     # Check NO (Down)
-                    if 0.95 <= price_no <= 0.99:
-                        self.trigger_paper_trade(market, "Down", price_no, "Strategy A (Arbitrage Lock)")
-                    elif 0.01 <= price_no <= 0.05:
-                        if self.market_locks.get(slug) != "LOCKED_STRATEGY_A":
-                            self.trigger_paper_trade(market, "Down", price_no, "Strategy B (Penny Sweep)")
+                    if 0.01 <= price_no <= 0.04:
+                        self.post_maker_limit_order(market, "Down", price_no, "Strategy B (Penny Sweep)")
 
                 # 3. Post-Close Settlement Resolution (+2s grace period exploit)
                 # Polymarket oracle settlement delay allows scanning/executing for up to 2s post-close
@@ -630,6 +650,12 @@ class TradingEngine:
                         self.market_locks.pop(slug)
                     self.resting_limit_orders = [o for o in self.resting_limit_orders if o["slug"] != slug]
                     
+                    # Also update any remaining LIMIT_POSTED trades to CANCELLED in database and activity log
+                    for trade in self.activity_log:
+                        if trade["slug"] == slug and trade["status"] == "LIMIT_POSTED":
+                            trade["status"] = "CANCELLED"
+                            self.db.resolve_trade(trade["tx_hash"], "CANCELLED", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+                    
                     # Remove from active listing
                     market["resolved"] = True
                     self.active_markets.pop(slug)
@@ -638,79 +664,46 @@ class TradingEngine:
             await self.broadcast()
             await asyncio.sleep(0.1)
 
-    def trigger_paper_trade(self, market, outcome, price, strategy_name):
-        """Simulates order submission, gas priority logic, slippage guards, and fill."""
+    def post_maker_limit_order(self, market, outcome, price, strategy_name):
+        """Simulates placing a resting maker limit order on the CLOB."""
         slug = market["slug"]
         
-        # Position sizing (based on historical average sizing)
-        if "Arbitrage" in strategy_name:
-            size_usdc = random.uniform(25.0, 45.0)
-        else:
-            # Adaptive sizing: scale down size based on remaining time and contract price to prevent large losses
-            # Lower price (lower probability) -> smaller USDC size to minimize exposure
-            time_factor = max(0.2, min(1.0, market.get("time_remaining", 5) / 5.0))
-            base_size = random.uniform(0.10, 0.25)
-            size_usdc = base_size * (price / 0.05) * time_factor
-            # Cap to keep it extremely tight and optimized
-            size_usdc = max(0.05, min(0.30, size_usdc))
+        # Check MAX_SIMULTANEOUS_TRADES guardrail
+        # A pool is active if there is an active trade with status in ['PENDING', 'LIMIT_POSTED']
+        active_pools = set(t["slug"] for t in self.activity_log if t["status"] in ["PENDING", "LIMIT_POSTED"])
+        for order in self.resting_limit_orders:
+            active_pools.add(order["slug"])
             
-        shares = size_usdc / price
-        
-        # Gas priority simulation
-        priority_gas_gwei = self.priority_gas_gwei
-        # Estimated Gas Cost = Gas Limit (150,000) * Price (Gwei * 1e-9) * MATIC price (0.55)
-        gas_cost_usdc = 150000 * (priority_gas_gwei * 1e-9) * self.matic_price
-        
-        # Expected Net Profit check
-        expected_net_profit = (shares * (1.00 - price)) - gas_cost_usdc
-        
-        if expected_net_profit <= 0.05:
-            self.add_system_log(f"[Blocked] Trade on {slug} skipped: Expected profit below gas-adjusted threshold.")
-            return
-            
-        # Slippage check
-        simulated_slippage = random.uniform(0.0, 0.015)
-        if simulated_slippage > self.max_slippage:
-            self.add_system_log(f"[Blocked] Trade on {slug} blocked: Slippage ({simulated_slippage:.3f}) exceeds limit.")
-            self.add_system_log(f"Slippage block fallback: Posting resting limit order at ${price:.3f} on {slug}")
-            
-            # Post resting limit order
-            tx_hash = f"0x{random.randbytes(32).hex()}"
-            self.resting_limit_orders.append({
-                "slug": slug,
-                "outcome": outcome,
-                "price": price,
-                "size": shares,
-                "strategy": strategy_name,
-                "tx_hash": tx_hash
-            })
-            
-            # Lock the market slug if it's an Arbitrage strategy to prevent Strategy B triggers
-            if "Arbitrage" in strategy_name:
-                self.market_locks[slug] = "LOCKED_STRATEGY_A"
+        if len(active_pools) >= self.max_simultaneous_trades and slug not in active_pools:
+            self.add_system_log(f"[Blocked] Maker limit order on {slug} blocked: Max simultaneous trades ({self.max_simultaneous_trades}) reached.")
             return
 
-        self.add_system_log(f"t-{abs(market['time_remaining'])}s: {strategy_name} triggered on {slug} for {outcome} @ ${price:.3f}")
-        self.add_system_log(f"Gas priority configured: {priority_gas_gwei} Gwei. Simulating block inclusion...")
+        # Check gas-adjusted expected net profit to clear block inclusion
+        shares = self.max_position_size_usdc / price
+        priority_gas_gwei = self.priority_gas_gwei
+        gas_cost_usdc = 150000 * (priority_gas_gwei * 1e-9) * self.matic_price
+        expected_net_profit = (shares * (1.00 - price)) - gas_cost_usdc
         
-        # Verify wallet capacity
-        if self.wallet < size_usdc:
-            self.add_system_log("Order rejected: Insufficient USDC balance.")
+        if expected_net_profit <= self.min_profit_threshold_usdc:
+            self.add_system_log(f"[Blocked] Maker limit order on {slug} blocked: Expected net profit ({expected_net_profit:.4f}) <= threshold ({self.min_profit_threshold_usdc}).")
             return
-            
-        # Deduct cost from wallet
-        self.wallet -= size_usdc
-        self.total_trades_count += 1
+
+        # Post resting limit order
+        tx_hash = f"0x{random.randbytes(32).hex()}"
+        self.resting_limit_orders.append({
+            "slug": slug,
+            "outcome": outcome,
+            "price": price,
+            "size": shares,
+            "strategy": strategy_name,
+            "tx_hash": tx_hash
+        })
         
-        # Mutual Exclusion State Machine Lock
-        if "Arbitrage" in strategy_name:
-            self.market_locks[slug] = "LOCKED_STRATEGY_A"
-        
-        # Record trade as PENDING (waiting for close tick resolution)
-        trade = self.add_activity(slug, outcome, price, shares, "PENDING")
+        # Record trade as LIMIT_POSTED
+        trade = self.add_activity(slug, outcome, price, shares, "LIMIT_POSTED", tx_hash)
         trade["strategy"] = strategy_name
         
-        # Insert trade into database
+        # Insert trade into database with LIMIT_POSTED status
         self.db.insert_trade(
             trade["tx_hash"], 
             trade["datetime_utc"], 
@@ -720,10 +713,10 @@ class TradingEngine:
             price, 
             shares, 
             priority_gas_gwei, 
-            "PENDING"
+            "LIMIT_POSTED"
         )
         
-        self.add_system_log(f"Order filled successfully. Tx: {trade['tx_hash'][:10]}... | Position: {shares:.1f} shares")
+        self.add_system_log(f"[MAKER LIMIT POSTED] t-{abs(market['time_remaining'])}s: Maker limit order placed on {slug} for {outcome} @ ${price:.3f}")
 
     async def latency_jitter_simulation(self):
         """Simulates network jitter of WebSocket connectivity and gas fluctuations."""
