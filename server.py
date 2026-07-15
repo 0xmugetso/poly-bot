@@ -367,13 +367,19 @@ class TradingEngine:
             self.add_system_log("Frontend client disconnected.")
 
     async def binance_price_feed(self):
-        """Streams prices from Binance Spot WebSocket with auto-reconnection and heartbeats."""
+        """Streams prices from Binance Spot WebSocket with auto-reconnection and heartbeats.
+        Exhibits self-healing properties: falls back to Binance.US if the host is geoblocked (HTTP 451).
+        """
         symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
-        url = "wss://stream.binance.com:9443/ws"
+        global_url = "wss://stream.binance.com:9443/ws"
+        us_url = "wss://stream.binance.us:9443/ws"
+        
+        use_us_feed = False
         
         while True:
+            url = us_url if use_us_feed else global_url
             try:
-                self.add_system_log("Connecting to Binance Spot WebSocket...")
+                self.add_system_log(f"Connecting to {'Binance.US' if use_us_feed else 'Binance Global'} Spot WebSocket...")
                 ssl_context = ssl._create_unverified_context()
                 async with websockets.connect(url, ssl=ssl_context) as ws:
                     # Subscribe to tickers
@@ -383,7 +389,7 @@ class TradingEngine:
                         "id": 1
                     }
                     await ws.send(json.dumps(sub_msg))
-                    self.add_system_log("Subscribed to Binance price feeds.")
+                    self.add_system_log(f"Subscribed to {'Binance.US' if use_us_feed else 'Binance Global'} price feeds.")
                     
                     while True:
                         try:
@@ -399,8 +405,14 @@ class TradingEngine:
                             symbol = ticker.replace("USDT", "")
                             self.spot_prices[symbol] = price
             except Exception as e:
-                self.add_system_log(f"Binance WebSocket error: {e}. Reconnecting in 1s...")
-                await asyncio.sleep(1)
+                err_str = str(e)
+                self.add_system_log(f"Binance WebSocket error: {err_str}")
+                if "451" in err_str and not use_us_feed:
+                    self.add_system_log("HTTP 451 detected (Geo-blocked). Switching to Binance.US feed...")
+                    use_us_feed = True
+                else:
+                    self.add_system_log("Reconnecting in 1s...")
+                    await asyncio.sleep(1)
 
     def fetch_market_details(self, slug):
         """Queries the Polymarket Gamma API to get details of a slug."""
