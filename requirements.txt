@@ -1,0 +1,4 @@
+websockets
+uvloop
+psycopg2-binary
+pandas

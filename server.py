@@ -729,7 +729,7 @@ async def main():
     asyncio.create_task(engine.latency_jitter_simulation())
     
     # Start Local WebSocket Server
-    port = 8000
+    port = int(os.environ.get("PORT", 8000))
     engine.add_system_log(f"Starting Local WebSocket Server on ws://localhost:{port}")
     async with websockets.serve(engine.handle_ws, "0.0.0.0", port):
         await asyncio.Event().wait()  # keep running
