@@ -107,7 +107,8 @@ export default function App() {
   }, []);
 
   const connectWS = () => {
-    ws.current = new WebSocket("ws://localhost:8000");
+    const wsUrl = import.meta.env.VITE_WS_URL || "ws://localhost:8000";
+    ws.current = new WebSocket(wsUrl);
 
     ws.current.onopen = () => {
       setConnected(true);
