@@ -341,6 +341,7 @@ export default function App() {
 
     ws.current.onclose = () => {
       setConnected(false);
+      setBacktesting(false);
       addLocalSystemLog("Connection closed. Retrying connection in 3 seconds...");
       setTimeout(connectWS, 3000);
     };

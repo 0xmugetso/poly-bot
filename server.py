@@ -835,9 +835,8 @@ class TradingEngine:
                     market["resolved"] = True
                     self.active_markets.pop(slug)
             
-            # Broadcast state to frontend
             await self.broadcast()
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(1.0)
 
     def post_maker_limit_order(self, market, outcome, price, strategy_name):
         """Simulates placing a resting maker limit order on the CLOB."""
