@@ -95,3 +95,31 @@
   animation: breathing-orange 2s infinite ease-in-out;
 }
 
+/* Number changes value flashes */
+@keyframes flash-green {
+  0% { color: #10B981; text-shadow: 0 0 8px rgba(16, 185, 129, 0.5); }
+  100% { color: inherit; text-shadow: none; }
+}
+
+@keyframes flash-red {
+  0% { color: #EF4444; text-shadow: 0 0 8px rgba(239, 68, 68, 0.5); }
+  100% { color: inherit; text-shadow: none; }
+}
+
+@keyframes flash-blue {
+  0% { color: #60A5FA; text-shadow: 0 0 8px rgba(96, 165, 250, 0.5); }
+  100% { color: inherit; text-shadow: none; }
+}
+
+.animate-flash-green {
+  animation: flash-green 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.animate-flash-red {
+  animation: flash-red 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.animate-flash-blue {
+  animation: flash-blue 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+}
+

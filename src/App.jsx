@@ -16,6 +16,38 @@ import {
 
 const PRICE_DECIMALS = { BTC: 1, ETH: 2, SOL: 2, XRP: 4, BNB: 2 };
 
+// Helper component to flash numbers on updates
+function AnimatedValue({ value, format, colorType }) {
+  const prevValueRef = useRef(value);
+  const [flashClass, setFlashClass] = useState("");
+  
+  useEffect(() => {
+    if (value !== prevValueRef.current) {
+      if (colorType === "directional") {
+        if (value > prevValueRef.current) {
+          setFlashClass("animate-flash-green");
+        } else if (value < prevValueRef.current) {
+          setFlashClass("animate-flash-red");
+        }
+      } else {
+        setFlashClass("animate-flash-blue");
+      }
+      prevValueRef.current = value;
+      
+      const timer = setTimeout(() => {
+        setFlashClass("");
+      }, 800);
+      return () => clearTimeout(timer);
+    }
+  }, [value, colorType]);
+  
+  return (
+    <span className={`inline-block transition-all duration-300 ${flashClass}`}>
+      {format ? format(value) : value}
+    </span>
+  );
+}
+
 // Custom lightweight SVG Sparkline component for zero dependencies and high performance
 function Sparkline({ data }) {
   if (!data || data.length < 2) return null;
@@ -97,6 +129,7 @@ export default function App() {
   const [liveObi, setLiveObi] = useState({ BTC: 0.0, ETH: 0.0, SOL: 0.0, XRP: 0.0, BNB: 0.0 });
   const [clobClockOffset, setClobClockOffset] = useState(0.0);
   const [currentTimes, setCurrentTimes] = useState({ local: "", utc: "", clob: "" });
+  const [userHasScrolledUp, setUserHasScrolledUp] = useState(false);
   
   const ws = useRef(null);
   const consoleContainerRef = useRef(null);
@@ -244,12 +277,20 @@ export default function App() {
     }
   };
 
+  // Scroll detection to let user read logs without snapping
+  const handleConsoleScroll = (e) => {
+    const target = e.target;
+    // If user scrolls up and stays > 40px away from bottom, mark as userHasScrolledUp
+    const isAtBottom = target.scrollHeight - target.scrollTop - target.clientHeight < 40;
+    setUserHasScrolledUp(!isAtBottom);
+  };
+
   // Handle autoscroll for system console (container-based to prevent page-snapping)
   useEffect(() => {
-    if (!isPausedStream && consoleContainerRef.current) {
+    if (!isPausedStream && !userHasScrolledUp && consoleContainerRef.current) {
       consoleContainerRef.current.scrollTop = consoleContainerRef.current.scrollHeight;
     }
-  }, [systemLogs, isPausedStream]);
+  }, [systemLogs, isPausedStream, userHasScrolledUp]);
 
   // Log filter helper
   const filteredLogs = systemLogs.filter(log => {
@@ -427,16 +468,18 @@ export default function App() {
           if (obi > 0.65) obiColor = "text-emerald-400 font-bold";
           else if (obi < -0.65) obiColor = "text-rose-400 font-bold";
           return (
-            <div key={sym} className="flex flex-col items-center p-2 rounded bg-zinc-950/40 border border-[#1E1E2F]/40 min-w-[120px]">
+            <div key={sym} className="flex flex-col items-center p-2 rounded bg-zinc-950/40 border border-[#1E1E2F]/40 w-[150px] flex-shrink-0">
               <div className="flex items-center gap-2">
                 <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-slate-500">{sym}</span>
                 <span className="font-mono-val text-sm font-semibold text-slate-200">
-                  ${price.toLocaleString(undefined, { minimumFractionDigits: PRICE_DECIMALS[sym] || 2 })}
+                  <AnimatedValue value={price} format={(v) => `$${v.toLocaleString(undefined, { minimumFractionDigits: PRICE_DECIMALS[sym] || 2 })}`} colorType="directional" />
                 </span>
               </div>
               <div className="flex items-center gap-1.5 mt-1 text-[9px] font-mono">
                 <span className="text-slate-500">OBI:</span>
-                <span className={obiColor}>{obi > 0 ? "+" : ""}{obi.toFixed(3)}</span>
+                <span className={obiColor}>
+                  <AnimatedValue value={obi} format={(v) => `${v > 0 ? "+" : ""}${v.toFixed(3)}`} colorType="directional" />
+                </span>
               </div>
             </div>
           );
@@ -449,7 +492,9 @@ export default function App() {
         <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col justify-between">
           <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Polygon Gas Tracker</span>
           <div className="flex items-baseline gap-2 mt-1">
-            <span className="text-2xl font-mono-val font-bold text-amber-400">{priorityGasGwei} Gwei</span>
+            <span className="text-2xl font-mono-val font-bold text-amber-400">
+              <AnimatedValue value={priorityGasGwei} format={(v) => `${v} Gwei`} colorType="simple" />
+            </span>
             <span className="text-xs font-mono text-slate-400">Est. Tx: ${(150000 * priorityGasGwei * 1e-9 * maticPrice).toFixed(4)} USDC</span>
           </div>
           <div className="text-[10px] font-mono text-slate-500 uppercase mt-1">
@@ -654,7 +699,11 @@ export default function App() {
             </div>
           </div>
 
-          <div ref={consoleContainerRef} className="flex-grow p-4 overflow-y-auto font-mono text-xs leading-relaxed space-y-1.5 flex flex-col justify-start">
+          <div 
+            ref={consoleContainerRef} 
+            onScroll={handleConsoleScroll}
+            className="flex-grow p-4 overflow-y-auto font-mono text-xs leading-relaxed space-y-1.5 flex flex-col justify-start"
+          >
             {filteredLogs.map((log, idx) => {
               let styleClass = "text-slate-400";
               if (log.includes("[MAKER LIMIT POSTED]")) styleClass = "text-amber-400 font-medium";
