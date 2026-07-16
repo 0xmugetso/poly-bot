@@ -246,6 +246,7 @@ class TradingEngine:
         self.resting_limit_orders = []    # list of active resting orders
         self.priority_gas_gwei = 65      # Polygon priority gas fee Gwei
         self.matic_price = 0.55          # Matic price in USDC
+        self.clob_clock_offset = 0.0     # Synchronized clock offset
         
         self.add_system_log("POLY-BOT trading engine initialized.")
         
@@ -448,7 +449,8 @@ class TradingEngine:
                 await asyncio.sleep(1)
                 continue
                 
-            t = int(time.time())
+            t_synced = time.time() + self.clob_clock_offset
+            t = int(t_synced)
             t_rounded_5m = t - (t % 300)
             t_rounded_15m = t - (t % 900)
             
@@ -511,6 +513,34 @@ class TradingEngine:
                 spot = self.spot_prices[symbol]
                 strike = market["strike_price"]
                 
+                # Strict boundary fence check: Time Delta <= 0.5 seconds
+                time_delta = float(market["close_time"]) - t_synced
+                fence_active = (time_delta <= 0.5)
+                
+                if fence_active:
+                    # Instantly kill state machine for this slug
+                    if slug in self.market_locks:
+                        self.market_locks.pop(slug)
+                    
+                    # Cancel any resting limits
+                    original_len = len(self.resting_limit_orders)
+                    self.resting_limit_orders = [o for o in self.resting_limit_orders if o["slug"] != slug]
+                    if len(self.resting_limit_orders) < original_len:
+                        self.add_system_log(f"[FENCE ACTIVE] Synced time delta = {time_delta:.3f}s <= 0.5s. Cancelled resting orders for {slug}.")
+                    
+                    # Update database LIMIT_POSTED to CANCELLED
+                    for trade in self.activity_log:
+                        if trade["slug"] == slug and trade["status"] == "LIMIT_POSTED":
+                            trade["status"] = "CANCELLED"
+                            self.db.resolve_trade(trade["tx_hash"], "CANCELLED", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+                
+                # Strike proximity check at t = 5s before close
+                if time_remaining <= 5 and "proximity_enabled" not in market:
+                    proximity = abs(spot - strike) / strike
+                    is_valid = (proximity <= 0.0002)
+                    market["proximity_enabled"] = is_valid
+                    self.add_system_log(f"[{'ENABLED' if is_valid else 'BLOCKED'}] Proximity check for {slug}: Proximity = {proximity:.6f} (Limit: 0.0002)")
+                
                 # Dynamic contract pricing estimation based on spot vs strike
                 # Difference between spot and strike
                 delta = spot - strike
@@ -543,64 +573,67 @@ class TradingEngine:
                     }
                 }
 
-                # Evaluate active resting limit orders for this slug
-                for order in list(self.resting_limit_orders):
-                    if order["slug"] == slug:
-                        is_fill = False
-                        if order["outcome"] == "Up" and price_yes <= order["price"]:
-                            is_fill = True
-                        elif order["outcome"] == "Down" and price_no <= order["price"]:
-                            is_fill = True
-                            
-                        if is_fill:
-                            cost = order["size"] * order["price"]
-                            if self.wallet >= cost:
-                                self.wallet -= cost
-                                self.total_trades_count += 1
+                if not fence_active:
+                    # Evaluate active resting limit orders for this slug
+                    for order in list(self.resting_limit_orders):
+                        if order["slug"] == slug:
+                            is_fill = False
+                            if order["outcome"] == "Up" and price_yes <= order["price"]:
+                                is_fill = True
+                            elif order["outcome"] == "Down" and price_no <= order["price"]:
+                                is_fill = True
                                 
-                                # Re-hydrate or update the LIMIT_POSTED activity log item to PENDING
-                                matched_trade = None
-                                for trade in self.activity_log:
-                                    if trade["tx_hash"] == order["tx_hash"]:
-                                        matched_trade = trade
-                                        break
-                                
-                                if matched_trade:
-                                    matched_trade["status"] = "PENDING"
-                                    self.db.resolve_trade(order["tx_hash"], "PENDING", None)
-                                else:
-                                    trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "PENDING", order["tx_hash"])
-                                    trade["strategy"] = order["strategy"]
-                                    self.db.insert_trade(
-                                        order["tx_hash"], 
-                                        trade["datetime_utc"], 
-                                        slug, 
-                                        order["strategy"], 
-                                        order["outcome"], 
-                                        order["price"], 
-                                        order["size"], 
-                                        self.priority_gas_gwei, 
-                                        "PENDING"
-                                    )
-                                
-                                self.add_system_log(f"[MAKER LIMIT FILLED] Limit order for {order['outcome']} filled on {slug} @ ${order['price']:.3f}")
-                            self.resting_limit_orders.remove(order)
+                            if is_fill:
+                                cost = order["size"] * order["price"]
+                                if self.wallet >= cost:
+                                    self.wallet -= cost
+                                    self.total_trades_count += 1
+                                    
+                                    # Re-hydrate or update the LIMIT_POSTED activity log item to PENDING
+                                    matched_trade = None
+                                    for trade in self.activity_log:
+                                        if trade["tx_hash"] == order["tx_hash"]:
+                                            matched_trade = trade
+                                            break
+                                    
+                                    if matched_trade:
+                                        matched_trade["status"] = "PENDING"
+                                        self.db.resolve_trade(order["tx_hash"], "PENDING", None)
+                                    else:
+                                        trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "PENDING", order["tx_hash"])
+                                        trade["strategy"] = order["strategy"]
+                                        self.db.insert_trade(
+                                            order["tx_hash"], 
+                                            trade["datetime_utc"], 
+                                            slug, 
+                                            order["strategy"], 
+                                            order["outcome"], 
+                                            order["price"], 
+                                            order["size"], 
+                                            self.priority_gas_gwei, 
+                                            "PENDING"
+                                        )
+                                    
+                                    self.add_system_log(f"[MAKER LIMIT FILLED] Limit order for {order['outcome']} filled on {slug} @ ${order['price']:.3f}")
+                                self.resting_limit_orders.remove(order)
 
-                # Evaluate execution triggers
-                # Window: final -5 seconds to +2 seconds epoch boundaries
-                if -5 <= time_remaining <= 2 and market["last_evaluated"] != t:
-                    market["last_evaluated"] = t
-                    
-                    # Strategy A is hard deprecated.
-                    # We evaluate YES/NO only for Strategy B (Penny Sweeps) targeting $0.01 to $0.04
-                    
-                    # Check YES (Up)
-                    if 0.01 <= price_yes <= 0.04:
-                        self.post_maker_limit_order(market, "Up", price_yes, "Strategy B (Penny Sweep)")
+                    # Evaluate execution triggers
+                    # Window: final -5 seconds to +2 seconds epoch boundaries
+                    if -5 <= time_remaining <= 2 and market["last_evaluated"] != t:
+                        market["last_evaluated"] = t
                         
-                    # Check NO (Down)
-                    if 0.01 <= price_no <= 0.04:
-                        self.post_maker_limit_order(market, "Down", price_no, "Strategy B (Penny Sweep)")
+                        # Strategy A is hard deprecated.
+                        # We evaluate YES/NO only for Strategy B (Penny Sweeps) targeting $0.01 to $0.04
+                        
+                        # Check YES (Up)
+                        if 0.01 <= price_yes <= 0.04:
+                            if market.get("proximity_enabled", True):
+                                self.post_maker_limit_order(market, "Up", price_yes, "Strategy B (Penny Sweep)")
+                            
+                        # Check NO (Down)
+                        if 0.01 <= price_no <= 0.04:
+                            if market.get("proximity_enabled", True):
+                                self.post_maker_limit_order(market, "Down", price_no, "Strategy B (Penny Sweep)")
 
                 # 3. Post-Close Settlement Resolution (+2s grace period exploit)
                 # Polymarket oracle settlement delay allows scanning/executing for up to 2s post-close
@@ -725,11 +758,57 @@ class TradingEngine:
             self.priority_gas_gwei = max(35, min(180, self.priority_gas_gwei + random.randint(-8, 10)))
             await asyncio.sleep(2)
 
+    async def sync_clob_clock(self):
+        """Periodically syncs system time against Polymarket CLOB Server Time."""
+        import urllib.request
+        import json
+        from datetime import datetime, timezone
+        
+        url = "https://clob.polymarket.com/time"
+        self.add_system_log("CLOB Server Time sync task started.")
+        
+        while True:
+            try:
+                def _fetch():
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req, timeout=3) as response:
+                        return response.read().decode('utf-8')
+                        
+                res = await asyncio.to_thread(_fetch)
+                if res:
+                    try:
+                        try:
+                            data = json.loads(res)
+                            if isinstance(data, dict):
+                                time_val = data.get("time") or data.get("timestamp") or res
+                            else:
+                                time_val = data
+                        except (ValueError, TypeError):
+                            time_val = res.strip().replace('"', '')
+                            
+                        if isinstance(time_val, str) and ("T" in time_val or "-" in time_val):
+                            iso_str = time_val.replace("Z", "+00:00").replace('"', '').strip()
+                            dt = datetime.fromisoformat(iso_str)
+                            server_time = dt.timestamp()
+                        else:
+                            server_time = float(time_val)
+                            
+                        local_time = time.time()
+                        self.clob_clock_offset = server_time - local_time
+                        # Optional debugging log
+                        # self.add_system_log(f"Synced CLOB clock. Offset: {self.clob_clock_offset:.3f}s")
+                    except Exception as parse_err:
+                        self.add_system_log(f"Error parsing CLOB time response: {res} -> {parse_err}")
+            except Exception as e:
+                pass
+            await asyncio.sleep(10)
+
 async def main():
     engine = TradingEngine()
     
     # Start background threads/tasks
     asyncio.create_task(engine.binance_price_feed())
+    asyncio.create_task(engine.sync_clob_clock())
     asyncio.create_task(engine.market_management_loop())
     asyncio.create_task(engine.latency_jitter_simulation())
     

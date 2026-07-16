@@ -217,6 +217,31 @@ export default function App() {
     return true;
   });
 
+  // Group and aggregate fractional order book fills by transaction hash or timestamp
+  const getAggregatedActivityLog = () => {
+    const groups = {};
+    activityLog.forEach(act => {
+      // Group by tx_hash or a fallback composite key of timestamp + outcome
+      const key = act.tx_hash || `${act.slug}_${act.datetime_utc}_${act.outcome}`;
+      if (!groups[key]) {
+        groups[key] = { ...act };
+      } else {
+        const existing = groups[key];
+        const totalSize = existing.size + act.size;
+        if (totalSize > 0) {
+          // Weighted average price
+          existing.price = (existing.price * existing.size + act.price * act.size) / totalSize;
+        }
+        existing.size = totalSize;
+        // Elevate status if resolved (e.g. if one was PENDING but now WIN or LOSS)
+        if (act.status !== "PENDING" && act.status !== "LIMIT_POSTED") {
+          existing.status = act.status;
+        }
+      }
+    });
+    return Object.values(groups);
+  };
+
   // Clean win rate calculations
   const totalResolved = wins + losses;
   const winRateVal = totalResolved > 0 ? (wins / totalResolved * 100).toFixed(2) : "0.00";
@@ -472,7 +497,7 @@ export default function App() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#1E1E2F]/40">
-                {activityLog.slice().reverse().map((act) => {
+                {getAggregatedActivityLog().reverse().map((act) => {
                   let badgeClass = "bg-amber-950/20 text-amber-400 border border-amber-900/30";
                   if (act.status === "WIN") badgeClass = "bg-emerald-950/20 text-emerald-400 border border-emerald-900/30";
                   if (act.status === "LOSS") badgeClass = "bg-rose-950/20 text-rose-400 border border-rose-900/30";
@@ -508,7 +533,7 @@ export default function App() {
                     </tr>
                   );
                 })}
-                {activityLog.length === 0 && (
+                {getAggregatedActivityLog().length === 0 && (
                   <tr>
                     <td colSpan="7" className="text-center py-16 text-slate-500">
                       [ WAITING FOR SYSTEM TRADING TRIGGERS... ]
