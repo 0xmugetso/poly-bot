@@ -262,6 +262,8 @@ class TradingEngine:
         self.live_obi = {"BTC": 0.0, "ETH": 0.0, "SOL": 0.0, "XRP": 0.0, "BNB": 0.0}
         self.price_decimals = {"BTC": 1, "ETH": 2, "SOL": 2, "XRP": 4, "BNB": 2}
         self.active_markets = {}  # symbol -> market_details
+        self.rolling_prices = {sym: [] for sym in ["BTC", "ETH", "SOL", "XRP", "BNB"]}
+        self.volatility_coefficient = 0.15
         
         # Activity and logs
         self.activity_log = []
@@ -493,6 +495,58 @@ class TradingEngine:
                     self.add_system_log("Reconnecting in 1s...")
                     await asyncio.sleep(1)
 
+    def calculate_std(self, prices):
+        if len(prices) < 2:
+            return 0.0
+        mean = sum(prices) / len(prices)
+        variance = sum((x - mean) ** 2 for x in prices) / (len(prices) - 1)
+        import math
+        return math.sqrt(variance)
+
+    async def initialize_rolling_prices(self):
+        """Populates the 30-period rolling 1-minute price cache from Binance Spot REST API."""
+        self.add_system_log("Initializing rolling 30-minute price cache for volatility-scaled gates...")
+        now_ms = int(time.time() * 1000)
+        start_ms = now_ms - (35 * 60 * 1000)
+        ctx = ssl._create_unverified_context()
+        
+        for sym in self.symbols:
+            pair = f"{sym}USDT"
+            hosts = ["https://api.binance.com", "https://api.binance.us"]
+            fetched = False
+            for host in hosts:
+                url = f"{host}/api/v3/klines?symbol={pair}&interval=1m&startTime={start_ms}&endTime={now_ms}&limit=50"
+                try:
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                    res = urllib.request.urlopen(req, timeout=3, context=ctx).read()
+                    data = json.loads(res)
+                    if data and isinstance(data, list):
+                        closes = [float(row[4]) for row in data[-30:]]
+                        self.rolling_prices[sym] = closes
+                        self.add_system_log(f"Cached {len(closes)} rolling prices for {sym} (last: ${closes[-1]:.2f}).")
+                        fetched = True
+                        break
+                except Exception:
+                    continue
+            if not fetched:
+                # Fallback mock values
+                mock_price = self.live_prices.get(sym, 10.0)
+                self.rolling_prices[sym] = [mock_price * (1 + random.uniform(-0.001, 0.001)) for _ in range(30)]
+                self.add_system_log(f"Binance API geoblocked. Generated 30 mock rolling prices for {sym}.")
+
+    async def rolling_prices_update_loop(self):
+        """Appends latest spot prices to rolling cache every minute."""
+        while True:
+            await asyncio.sleep(60)
+            if self.status != "RUNNING":
+                continue
+            for sym in self.symbols:
+                price = self.spot_prices.get(sym)
+                if price:
+                    self.rolling_prices[sym].append(price)
+                    if len(self.rolling_prices[sym]) > 30:
+                        self.rolling_prices[sym].pop(0)
+
     def fetch_market_details(self, slug):
         """Queries the Polymarket Gamma API to get details of a slug."""
         try:
@@ -653,15 +707,21 @@ class TradingEngine:
                             trade["status"] = "CANCELLED"
                             self.db.resolve_trade(trade["tx_hash"], "CANCELLED", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
                 
-                # Strike proximity check at t = 5s before close
+                # Volatility-Scaled Dynamic Proximity Threshold Check at t = 5s before close
                 if time_remaining <= 5 and "proximity_enabled" not in market:
-                    proximity = abs(spot - strike) / strike
-                    is_valid = (proximity <= 0.0002)
-                    market["proximity_enabled"] = is_valid
+                    prices = self.rolling_prices.get(symbol, [])
+                    std = self.calculate_std(prices)
+                    if std <= 0.0:
+                        std = spot * 0.0005  # fallback to 0.05% of spot
+                        
+                    dynamic_allowed_delta = std * self.volatility_coefficient
                     spot_strike_delta = abs(spot - strike)
                     
+                    is_valid = (spot_strike_delta <= dynamic_allowed_delta)
+                    market["proximity_enabled"] = is_valid
+                    
                     if not is_valid:
-                        self.add_system_log(f"[Blocked] Proximity check for {slug}: Proximity = {proximity:.6f} (Limit: 0.0002)")
+                        self.add_system_log(f"[Blocked] Proximity check for {slug}: Price Delta = ${spot_strike_delta:.3f} (Limit: ${dynamic_allowed_delta:.3f}, Std: {std:.3f})")
                         if not market.get("blocked_logged", False):
                             tx_hash = f"0x{random.randbytes(32).hex()}"
                             self.db.insert_trade(
@@ -682,12 +742,11 @@ class TradingEngine:
                                 rejection_reason="PRICE_PROXIMITY_FAIL",
                                 spot_strike_delta=spot_strike_delta
                             )
-                            # Create a fake activity log item for streaming to UI
                             self.add_activity(slug, "Up/Down", 0.0, 0.0, "BLOCKED", tx_hash)
-                            self.add_system_log(f"[BLOCKED] {symbol}-5M BLOCKED: Proximity Delta (${spot_strike_delta:.3f}) exceeded 0.02% limit")
+                            self.add_system_log(f"[BLOCKED] {symbol}-5M BLOCKED: Price Delta (${spot_strike_delta:.3f}) exceeded dynamic limit (${dynamic_allowed_delta:.3f})")
                             market["blocked_logged"] = True
                     else:
-                        self.add_system_log(f"[ENABLED] Proximity check for {slug}: Proximity = {proximity:.6f} (Limit: 0.0002)")
+                        self.add_system_log(f"[ENABLED] Proximity check for {slug}: Price Delta = ${spot_strike_delta:.3f} (Limit: ${dynamic_allowed_delta:.3f}, Std: {std:.3f})")
                 
                 # Dynamic contract pricing estimation based on spot vs strike
                 # Difference between spot and strike
@@ -1185,7 +1244,7 @@ class TradingEngine:
         try:
             start_date = params.get("startDate")
             end_date = params.get("endDate")
-            proximity_limit = float(params.get("proximityLimit", 0.02)) / 100.0
+            proximity_limit = float(params.get("proximityLimit", 0.15))
             obi_cutoff = float(params.get("obiCutoff", 0.65))
             base_size = float(params.get("baseSize", 10.0))
             
@@ -1347,8 +1406,12 @@ class TradingEngine:
 async def main():
     engine = TradingEngine()
     
+    # Initialize rolling 30-minute prices on startup
+    await engine.initialize_rolling_prices()
+    
     # Start background threads/tasks
     asyncio.create_task(engine.binance_price_feed())
+    asyncio.create_task(engine.rolling_prices_update_loop())
     asyncio.create_task(engine.sync_clob_clock())
     asyncio.create_task(engine.market_management_loop())
     asyncio.create_task(engine.latency_jitter_simulation())

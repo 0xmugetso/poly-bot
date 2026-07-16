@@ -229,7 +229,7 @@ export default function App() {
   const [backtestParams, setBacktestParams] = useState({
     startDate: new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString().slice(0, 10),
     endDate: new Date().toISOString().slice(0, 10),
-    proximityLimit: 0.02,
+    proximityLimit: 0.15,
     obiCutoff: 0.65,
     baseSize: 10.0
   });
@@ -941,13 +941,13 @@ export default function App() {
 
               <div className="flex flex-col gap-1.5">
                 <div className="flex justify-between text-[10px] font-mono uppercase">
-                  <span className="text-slate-500">Proximity Fence</span>
-                  <span className="text-slate-300 font-bold">{backtestParams.proximityLimit}%</span>
+                   <span className="text-slate-500">Vol Multiplier</span>
+                   <span className="text-slate-300 font-bold">{backtestParams.proximityLimit.toFixed(2)}x</span>
                 </div>
                 <input 
                   type="range"
-                  min="0.01"
-                  max="0.10"
+                  min="0.05"
+                  max="0.50"
                   step="0.01"
                   value={backtestParams.proximityLimit}
                   onChange={(e) => setBacktestParams(prev => ({ ...prev, proximityLimit: parseFloat(e.target.value) }))}
