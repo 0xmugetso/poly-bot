@@ -6,8 +6,10 @@ import ssl
 import sys
 import os
 import urllib.request
+import http
 from datetime import datetime, timezone, timedelta
 import websockets
+from backtester import Backtester
 
 # Try using uvloop policy for high performance hosted event loop
 try:
@@ -413,6 +415,14 @@ class TradingEngine:
                         "type": "csv_data",
                         "filename": filename,
                         "csv_content": csv_content
+                    }))
+                elif action == "run_backtest":
+                    params = data.get("params", {})
+                    self.add_system_log("Running historical backtest simulation request...")
+                    results = await asyncio.to_thread(self.run_backtest_simulation, params)
+                    await websocket.send(json.dumps({
+                        "type": "backtest_results",
+                        "results": results
                     }))
         except Exception as e:
             pass
@@ -1120,6 +1130,63 @@ class TradingEngine:
         except Exception as e:
             self.add_system_log(f"Database CSV export error: {e}")
 
+    def run_backtest_simulation(self, params):
+        """Runs the isolated backtester on a separate thread."""
+        try:
+            start_date = params.get("startDate")
+            end_date = params.get("endDate")
+            proximity_limit = float(params.get("proximityLimit", 0.02)) / 100.0
+            obi_cutoff = float(params.get("obiCutoff", 0.65))
+            base_size = float(params.get("baseSize", 10.0))
+            
+            backtester = Backtester(
+                start_date=start_date,
+                end_date=end_date,
+                proximity_limit=proximity_limit,
+                obi_cutoff=obi_cutoff,
+                base_size=base_size
+            )
+            return backtester.run()
+        except Exception as e:
+            return {"error": f"Backtest execution failed: {e}"}
+
+    async def http_handler(self, path, request_headers):
+        """Serves production built static React files from dist/ directory."""
+        if "Upgrade" in request_headers and request_headers["Upgrade"].lower() == "websocket":
+            return None # Proceed to websocket handler
+            
+        # Default to index.html for SPA router requests
+        if path == "/" or not "." in path.split("/")[-1]:
+            path = "/index.html"
+            
+        clean_path = path.lstrip("/")
+        file_path = os.path.join("dist", clean_path)
+        
+        if not os.path.exists(file_path):
+            file_path = "dist/index.html"
+            
+        if not os.path.exists(file_path):
+            return http.HTTPStatus.NOT_FOUND, [("Content-Type", "text/plain")], b"404 Not Found"
+            
+        content_type = "text/html"
+        if file_path.endswith(".js"):
+            content_type = "application/javascript"
+        elif file_path.endswith(".css"):
+            content_type = "text/css"
+        elif file_path.endswith(".svg"):
+            content_type = "image/svg+xml"
+        elif file_path.endswith(".png"):
+            content_type = "image/png"
+        elif file_path.endswith(".ico"):
+            content_type = "image/x-icon"
+            
+        try:
+            with open(file_path, "rb") as f:
+                body = f.read()
+            return http.HTTPStatus.OK, [("Content-Type", content_type)], body
+        except Exception as e:
+            return http.HTTPStatus.INTERNAL_SERVER_ERROR, [("Content-Type", "text/plain")], f"Error: {e}".encode()
+
     def generate_csv_string(self):
         """Queries database and generates the CSV content as a string."""
         import io
@@ -1221,7 +1288,7 @@ async def main():
     # Start Local WebSocket Server
     port = int(os.environ.get("PORT", 8000))
     engine.add_system_log(f"Starting Local WebSocket Server on ws://localhost:{port}")
-    async with websockets.serve(engine.handle_ws, "0.0.0.0", port):
+    async with websockets.serve(engine.handle_ws, "0.0.0.0", port, process_request=engine.http_handler):
         await asyncio.Event().wait()  # keep running
 
 if __name__ == "__main__":
