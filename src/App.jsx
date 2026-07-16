@@ -11,7 +11,9 @@ import {
   ExternalLink,
   ShieldCheck,
   Flame,
-  Download
+  Download,
+  Database,
+  Terminal
 } from 'lucide-react';
 
 const PRICE_DECIMALS = { BTC: 1, ETH: 2, SOL: 2, XRP: 4, BNB: 2 };
