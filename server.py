@@ -70,7 +70,7 @@ class DatabaseManager:
         
         trades_sql = """
         CREATE TABLE IF NOT EXISTS trades (
-            id VARCHAR(64) PRIMARY KEY,
+            id VARCHAR(128) PRIMARY KEY,
             timestamp_utc TIMESTAMP,
             market_slug VARCHAR(128),
             strategy VARCHAR(64),
