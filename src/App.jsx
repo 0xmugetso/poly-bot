@@ -94,6 +94,7 @@ export default function App() {
   const [isPausedStream, setIsPausedStream] = useState(false);
   const [equityHistory, setEquityHistory] = useState([1420.55]);
   const [logFilter, setLogFilter] = useState("ALL"); // ALL, TRADES, BLOCKED, SYSTEM
+  const [liveObi, setLiveObi] = useState({ BTC: 0.0, ETH: 0.0, SOL: 0.0, XRP: 0.0, BNB: 0.0 });
   
   const ws = useRef(null);
   const consoleContainerRef = useRef(null);
@@ -145,6 +146,7 @@ export default function App() {
       setTotalTrades(data.total_trades_count);
       setResolvedTrades(data.resolved_trades_count);
       setSpotPrices(data.spot_prices);
+      setLiveObi(data.live_obi || {});
       setActiveMarkets(data.active_markets);
       setActivityLog(data.activity_log);
       setStatus(data.status);
@@ -397,16 +399,28 @@ export default function App() {
         </div>
       </section>
 
-      {/* 3. Spot Prices Strip */}
-      <section className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-3 mb-4 flex flex-wrap gap-6 items-center justify-around">
-        {Object.entries(spotPrices).map(([sym, price]) => (
-          <div key={sym} className="flex items-center gap-2">
-            <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-slate-500">{sym}</span>
-            <span className="font-mono-val text-sm font-semibold text-slate-200">
-              ${price.toLocaleString(undefined, { minimumFractionDigits: PRICE_DECIMALS[sym] || 2 })}
-            </span>
-          </div>
-        ))}
+      {/* 3. Spot Prices & OBI Strip */}
+      <section className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-3 mb-4 flex flex-wrap gap-4 items-center justify-around">
+        {Object.entries(spotPrices).map(([sym, price]) => {
+          const obi = liveObi[sym] || 0.0;
+          let obiColor = "text-slate-400";
+          if (obi > 0.65) obiColor = "text-emerald-400 font-bold";
+          else if (obi < -0.65) obiColor = "text-rose-400 font-bold";
+          return (
+            <div key={sym} className="flex flex-col items-center p-2 rounded bg-zinc-950/40 border border-[#1E1E2F]/40 min-w-[120px]">
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-slate-500">{sym}</span>
+                <span className="font-mono-val text-sm font-semibold text-slate-200">
+                  ${price.toLocaleString(undefined, { minimumFractionDigits: PRICE_DECIMALS[sym] || 2 })}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 mt-1 text-[9px] font-mono">
+                <span className="text-slate-500">OBI:</span>
+                <span className={obiColor}>{obi > 0 ? "+" : ""}{obi.toFixed(3)}</span>
+              </div>
+            </div>
+          );
+        })}
       </section>
 
       {/* 3.5 State Ledger and Gas Tracker Strip */}

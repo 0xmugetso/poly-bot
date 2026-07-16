@@ -252,6 +252,7 @@ class TradingEngine:
         # Live market tracking
         self.live_prices = {"BTC": 67250.0, "ETH": 3480.0, "SOL": 142.50, "XRP": 0.58, "BNB": 585.0}
         self.spot_prices = self.live_prices
+        self.live_obi = {"BTC": 0.0, "ETH": 0.0, "SOL": 0.0, "XRP": 0.0, "BNB": 0.0}
         self.price_decimals = {"BTC": 1, "ETH": 2, "SOL": 2, "XRP": 4, "BNB": 2}
         self.active_markets = {}  # symbol -> market_details
         
@@ -356,6 +357,7 @@ class TradingEngine:
             "total_trades_count": self.total_trades_count,
             "resolved_trades_count": self.resolved_trades_count,
             "spot_prices": self.spot_prices,
+            "live_obi": self.live_obi,
             "active_markets": list(self.active_markets.values()),
             "activity_log": self.activity_log,
             "system_logs": self.system_logs[-20:],
@@ -413,29 +415,24 @@ class TradingEngine:
             self.add_system_log("Frontend client disconnected.")
 
     async def binance_price_feed(self):
-        """Streams prices from Binance Spot WebSocket with auto-reconnection and heartbeats.
+        """Streams orderbook depth from Binance Spot WebSocket, calculates OBI, and derives mid-prices.
         Exhibits self-healing properties: falls back to Binance.US if the host is geoblocked (HTTP 451).
         """
-        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
-        global_url = "wss://stream.binance.com:9443/ws"
-        us_url = "wss://stream.binance.us:9443/ws"
+        pairs = ["btcusdt", "ethusdt", "solusdt", "xrpusdt", "bnbusdt"]
+        streams_param = "/".join(f"{p}@depth10@100ms" for p in pairs)
+        
+        global_url = f"wss://stream.binance.com:9443/stream?streams={streams_param}"
+        us_url = f"wss://stream.binance.us:9443/stream?streams={streams_param}"
         
         use_us_feed = False
         
         while True:
             url = us_url if use_us_feed else global_url
             try:
-                self.add_system_log(f"Connecting to {'Binance.US' if use_us_feed else 'Binance Global'} Spot WebSocket...")
+                self.add_system_log(f"Connecting to {'Binance.US' if use_us_feed else 'Binance Global'} Combined Depth WebSocket...")
                 ssl_context = ssl._create_unverified_context()
                 async with websockets.connect(url, ssl=ssl_context) as ws:
-                    # Subscribe to tickers
-                    sub_msg = {
-                        "method": "SUBSCRIBE",
-                        "params": [f"{s.lower()}@ticker" for s in symbols],
-                        "id": 1
-                    }
-                    await ws.send(json.dumps(sub_msg))
-                    self.add_system_log(f"Subscribed to {'Binance.US' if use_us_feed else 'Binance Global'} price feeds.")
+                    self.add_system_log(f"Subscribed to {'Binance.US' if use_us_feed else 'Binance Global'} 10-level @ 100ms partial book depth streams.")
                     
                     while True:
                         try:
@@ -445,11 +442,31 @@ class TradingEngine:
                             break
                             
                         data = json.loads(message)
-                        if "s" in data and "c" in data:
-                            ticker = data["s"]
-                            price = float(data["c"])
-                            symbol = ticker.replace("USDT", "").replace("USD", "")
-                            self.live_prices[symbol] = price
+                        if "stream" in data and "data" in data:
+                            stream_name = data["stream"]
+                            depth_data = data["data"]
+                            
+                            symbol = stream_name.split("@")[0].upper().replace("USDT", "").replace("USD", "")
+                            bids = depth_data.get("bids", [])
+                            asks = depth_data.get("asks", [])
+                            
+                            if bids and asks:
+                                # Calculate Order Book Imbalance (OBI)
+                                total_bid_vol = sum(float(b[1]) for b in bids)
+                                total_ask_vol = sum(float(a[1]) for a in asks)
+                                
+                                if (total_bid_vol + total_ask_vol) > 0:
+                                    obi = (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol)
+                                else:
+                                    obi = 0.0
+                                    
+                                self.live_obi[symbol] = obi
+                                
+                                # Derive Spot Price as best bid/ask mid point to maintain 100ms precision
+                                best_bid = float(bids[0][0])
+                                best_ask = float(asks[0][0])
+                                mid_price = (best_bid + best_ask) / 2.0
+                                self.live_prices[symbol] = mid_price
             except Exception as e:
                 err_str = str(e)
                 self.add_system_log(f"Binance WebSocket error: {err_str}")
@@ -665,12 +682,20 @@ class TradingEngine:
                         # Check YES (Up)
                         if 0.01 <= price_yes <= 0.04:
                             if market.get("proximity_enabled", True):
-                                self.post_maker_limit_order(market, "Up", price_yes, "Strategy B (Penny Sweep)")
+                                obi = self.live_obi.get(market["symbol"], 0.0)
+                                if obi > 0.65:
+                                    self.post_maker_limit_order(market, "Up", price_yes, "Strategy B (Penny Sweep)")
+                                else:
+                                    self.add_system_log(f"[Blocked] Up trigger skipped on {slug}: OBI ({obi:.3f}) <= 0.65")
                             
                         # Check NO (Down)
                         if 0.01 <= price_no <= 0.04:
                             if market.get("proximity_enabled", True):
-                                self.post_maker_limit_order(market, "Down", price_no, "Strategy B (Penny Sweep)")
+                                obi = self.live_obi.get(market["symbol"], 0.0)
+                                if obi < -0.65:
+                                    self.post_maker_limit_order(market, "Down", price_no, "Strategy B (Penny Sweep)")
+                                else:
+                                    self.add_system_log(f"[Blocked] Down trigger skipped on {slug}: OBI ({obi:.3f}) >= -0.65")
 
                 # 3. Post-Close Settlement Resolution (+2s grace period exploit)
                 # Polymarket oracle settlement delay allows scanning/executing for up to 2s post-close
