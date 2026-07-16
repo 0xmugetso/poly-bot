@@ -6,7 +6,7 @@ import ssl
 import sys
 import os
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import websockets
 
 # Try using uvloop policy for high performance hosted event loop
@@ -79,7 +79,12 @@ class DatabaseManager:
             position_size DECIMAL(10, 4),
             gas_fee_gwei DECIMAL(10, 2),
             pnl_status VARCHAR(32),
-            resolved_at TIMESTAMP
+            resolved_at TIMESTAMP,
+            execution_mode VARCHAR(32) DEFAULT 'MAKER_LIMIT',
+            strike_price DECIMAL(12, 4),
+            trigger_spot_price DECIMAL(12, 4),
+            time_delta_seconds DECIMAL(10, 4),
+            block_reason VARCHAR(128)
         );
         """
         
@@ -98,6 +103,19 @@ class DatabaseManager:
             cursor.execute(stats_sql)
             if not self.is_postgres:
                 self.conn.commit()
+                
+            # Migrations for SQLite if tables already exist
+            if not self.is_postgres:
+                for col, col_type in [("execution_mode", "VARCHAR(32) DEFAULT 'MAKER_LIMIT'"),
+                                      ("strike_price", "DECIMAL(12, 4)"),
+                                      ("trigger_spot_price", "DECIMAL(12, 4)"),
+                                      ("time_delta_seconds", "DECIMAL(10, 4)"),
+                                      ("block_reason", "VARCHAR(128)")]:
+                    try:
+                        cursor.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type};")
+                        self.conn.commit()
+                    except Exception:
+                        pass # column already exists
             
             # Mainnet Purge: Clean up mock records on launch under production mode
             if os.environ.get("ENV") == "LIVE_MAINNET_TRADING":
@@ -123,14 +141,18 @@ class DatabaseManager:
             self.log_fn(f"Database query error: {query} -> {e}")
             return None
 
-    def insert_trade(self, id_, timestamp, slug, strategy, outcome, price, size, gas, status):
+    def insert_trade(self, id_, timestamp, slug, strategy, outcome, price, size, gas, status,
+                     execution_mode="MAKER_LIMIT", strike_price=None, trigger_spot_price=None,
+                     time_delta_seconds=None, block_reason=None):
         query = """
-        INSERT INTO trades (id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        INSERT INTO trades (id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
+                            execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
         """
         if self.is_postgres:
             query = query.replace("?", "%s")
-        self.execute(query, (id_, timestamp, slug, strategy, outcome, price, size, gas, status))
+        self.execute(query, (id_, timestamp, slug, strategy, outcome, price, size, gas, status,
+                             execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason))
         
     def resolve_trade(self, id_, status, resolved_at):
         query = """
@@ -611,7 +633,11 @@ class TradingEngine:
                                             order["price"], 
                                             order["size"], 
                                             self.priority_gas_gwei, 
-                                            "PENDING"
+                                            "PENDING",
+                                            execution_mode="MAKER_LIMIT",
+                                            strike_price=order.get("strike_price"),
+                                            trigger_spot_price=order.get("trigger_spot_price"),
+                                            time_delta_seconds=order.get("time_delta_seconds")
                                         )
                                     
                                     self.add_system_log(f"[MAKER LIMIT FILLED] Limit order for {order['outcome']} filled on {slug} @ ${order['price']:.3f}")
@@ -702,23 +728,64 @@ class TradingEngine:
         slug = market["slug"]
         
         # Check MAX_SIMULTANEOUS_TRADES guardrail
-        # A pool is active if there is an active trade with status in ['PENDING', 'LIMIT_POSTED']
         active_pools = set(t["slug"] for t in self.activity_log if t["status"] in ["PENDING", "LIMIT_POSTED"])
         for order in self.resting_limit_orders:
             active_pools.add(order["slug"])
             
+        shares = self.max_position_size_usdc / price
+        priority_gas_gwei = self.priority_gas_gwei
+        spot = self.spot_prices[market["symbol"]]
+        strike = market["strike_price"]
+        time_delta = float(market["close_time"]) - (time.time() + self.clob_clock_offset)
+
         if len(active_pools) >= self.max_simultaneous_trades and slug not in active_pools:
             self.add_system_log(f"[Blocked] Maker limit order on {slug} blocked: Max simultaneous trades ({self.max_simultaneous_trades}) reached.")
+            
+            # Record blocked trade in database
+            tx_hash = f"0x{random.randbytes(32).hex()}"
+            self.db.insert_trade(
+                tx_hash,
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                slug,
+                strategy_name,
+                outcome,
+                price,
+                shares,
+                priority_gas_gwei,
+                "BLOCKED_BY_GUARDRAIL",
+                execution_mode="MAKER_LIMIT",
+                strike_price=strike,
+                trigger_spot_price=spot,
+                time_delta_seconds=time_delta,
+                block_reason="MAX_SIMULTANEOUS_TRADES"
+            )
             return
 
         # Check gas-adjusted expected net profit to clear block inclusion
-        shares = self.max_position_size_usdc / price
-        priority_gas_gwei = self.priority_gas_gwei
         gas_cost_usdc = 150000 * (priority_gas_gwei * 1e-9) * self.matic_price
         expected_net_profit = (shares * (1.00 - price)) - gas_cost_usdc
         
         if expected_net_profit <= self.min_profit_threshold_usdc:
             self.add_system_log(f"[Blocked] Maker limit order on {slug} blocked: Expected net profit ({expected_net_profit:.4f}) <= threshold ({self.min_profit_threshold_usdc}).")
+            
+            # Record blocked trade in database
+            tx_hash = f"0x{random.randbytes(32).hex()}"
+            self.db.insert_trade(
+                tx_hash,
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                slug,
+                strategy_name,
+                outcome,
+                price,
+                shares,
+                priority_gas_gwei,
+                "BLOCKED_BY_GUARDRAIL",
+                execution_mode="MAKER_LIMIT",
+                strike_price=strike,
+                trigger_spot_price=spot,
+                time_delta_seconds=time_delta,
+                block_reason="GAS_UNPROFITABLE"
+            )
             return
 
         # Post resting limit order
@@ -729,7 +796,10 @@ class TradingEngine:
             "price": price,
             "size": shares,
             "strategy": strategy_name,
-            "tx_hash": tx_hash
+            "tx_hash": tx_hash,
+            "strike_price": strike,
+            "trigger_spot_price": spot,
+            "time_delta_seconds": time_delta
         })
         
         # Record trade as LIMIT_POSTED
@@ -746,7 +816,11 @@ class TradingEngine:
             price, 
             shares, 
             priority_gas_gwei, 
-            "LIMIT_POSTED"
+            "LIMIT_POSTED",
+            execution_mode="MAKER_LIMIT",
+            strike_price=strike,
+            trigger_spot_price=spot,
+            time_delta_seconds=time_delta
         )
         
         self.add_system_log(f"[MAKER LIMIT POSTED] t-{abs(market['time_remaining'])}s: Maker limit order placed on {slug} for {outcome} @ ${price:.3f}")
@@ -803,6 +877,131 @@ class TradingEngine:
                 pass
             await asyncio.sleep(10)
 
+    async def automated_csv_export_loop(self):
+        """Generates a CSV snapshot of all trade records every 24 hours at 00:00:00 UTC."""
+        self.add_system_log("Automated CSV Export Service started.")
+        while True:
+            try:
+                now = datetime.now(timezone.utc)
+                tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                sleep_secs = (tomorrow - now).total_seconds()
+                if sleep_secs < 1:
+                    sleep_secs = 86400
+                self.add_system_log(f"Next scheduled CSV export in {sleep_secs:.1f} seconds (at 00:00:00 UTC).")
+                await asyncio.sleep(sleep_secs)
+                
+                date_str = datetime.now(timezone.utc).strftime("%Y_%m_%d")
+                filename = f"poly_bot_live_dump_{date_str}.csv"
+                await asyncio.to_thread(self.export_trades_to_csv, filename)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.add_system_log(f"Error in CSV export loop: {e}")
+                await asyncio.sleep(60)
+
+    def export_trades_to_csv(self, filename):
+        """Fetches all trades from the database and exports them to a CSV file."""
+        import csv
+        self.add_system_log(f"Starting database snapshot export to {filename}...")
+        try:
+            query = """
+            SELECT id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
+                   execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason
+            FROM trades
+            ORDER BY timestamp_utc ASC;
+            """
+            cursor = self.db.execute(query)
+            if not cursor:
+                self.add_system_log("Export failed: could not query database.")
+                return
+            
+            rows = cursor.fetchall()
+            
+            with open(filename, "w", newline="", encoding="utf-8") as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow([
+                    "timestamp",
+                    "datetime_utc",
+                    "market_slug",
+                    "strategy_type",
+                    "execution_mode",
+                    "side_outcome",
+                    "strike_price",
+                    "trigger_spot_price",
+                    "time_delta_seconds",
+                    "entry_price",
+                    "shares_count",
+                    "usdc_size",
+                    "priority_gas_gwei",
+                    "pnl_status",
+                    "block_reason",
+                    "transaction_hash"
+                ])
+                
+                for r in rows:
+                    tx_hash = r[0]
+                    dt_utc = r[1]
+                    slug = r[2]
+                    strategy = r[3]
+                    outcome = r[4]
+                    price = float(r[5]) if r[5] is not None else 0.0
+                    size = float(r[6]) if r[6] is not None else 0.0
+                    gas = float(r[7]) if r[7] is not None else 0.0
+                    status = r[8]
+                    mode = r[10] or "MAKER_LIMIT"
+                    strike = float(r[11]) if r[11] is not None else 0.0
+                    spot = float(r[12]) if r[12] is not None else 0.0
+                    time_delta = float(r[13]) if r[13] is not None else 0.0
+                    block_reason = r[14] or ""
+                    
+                    if isinstance(dt_utc, datetime):
+                        ts_ms = int(dt_utc.timestamp() * 1000)
+                        iso_str = dt_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                    else:
+                        try:
+                            clean_dt_str = str(dt_utc).replace("Z", "+00:00").strip()
+                            dt = datetime.fromisoformat(clean_dt_str)
+                            ts_ms = int(dt.timestamp() * 1000)
+                            iso_str = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                        except Exception:
+                            ts_ms = int(time.time() * 1000)
+                            iso_str = str(dt_utc)
+                            
+                    strat_upper = str(strategy).upper()
+                    if "PENNY" in strat_upper or "B" in strat_upper:
+                        strat_mapped = "STRATEGY_B_PENNY"
+                    else:
+                        strat_mapped = "STRATEGY_A_ARB"
+                        
+                    out_upper = str(outcome).upper()
+                    if "UP" in out_upper or "YES" in out_upper:
+                        side_mapped = "BUY_UP"
+                    else:
+                        side_mapped = "BUY_DOWN"
+                        
+                    writer.writerow([
+                        ts_ms,
+                        iso_str,
+                        slug,
+                        strat_mapped,
+                        mode,
+                        side_mapped,
+                        strike,
+                        spot,
+                        time_delta,
+                        price,
+                        size,
+                        round(price * size, 4),
+                        gas,
+                        status,
+                        block_reason,
+                        tx_hash
+                    ])
+                    
+            self.add_system_log(f"Export completed: {len(rows)} records flushed to {filename}.")
+        except Exception as e:
+            self.add_system_log(f"Database CSV export error: {e}")
+
 async def main():
     engine = TradingEngine()
     
@@ -811,6 +1010,12 @@ async def main():
     asyncio.create_task(engine.sync_clob_clock())
     asyncio.create_task(engine.market_management_loop())
     asyncio.create_task(engine.latency_jitter_simulation())
+    asyncio.create_task(engine.automated_csv_export_loop())
+    
+    # Run an initial export on startup to verify setup
+    date_str = datetime.now(timezone.utc).strftime("%Y_%m_%d")
+    filename = f"poly_bot_live_dump_{date_str}.csv"
+    asyncio.create_task(asyncio.to_thread(engine.export_trades_to_csv, filename))
     
     # Start Local WebSocket Server
     port = int(os.environ.get("PORT", 8000))
