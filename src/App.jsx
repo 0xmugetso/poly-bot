@@ -235,6 +235,7 @@ export default function App() {
   });
   const [backtestResults, setBacktestResults] = useState(null);
   const [backtesting, setBacktesting] = useState(false);
+  const [backtestLogs, setBacktestLogs] = useState([]);
   
   const ws = useRef(null);
   const consoleContainerRef = useRef(null);
@@ -282,8 +283,10 @@ export default function App() {
         setBacktesting(false);
         if (data.results.error) {
           addLocalSystemLog(`[SIMULATION ERROR] ${data.results.error}`);
+          setBacktestLogs([`[ERROR] Backtest run failed: ${data.results.error}`]);
         } else {
           setBacktestResults(data.results);
+          setBacktestLogs(data.results.logs || []);
           addLocalSystemLog(`[SIMULATION COMPLETED] Net PnL: $${data.results.net_profit} USDC | Win Rate: ${data.results.win_rate}%`);
         }
         return;
@@ -399,6 +402,11 @@ export default function App() {
   const handleRunBacktest = () => {
     if (ws.current && ws.current.readyState === WebSocket.OPEN) {
       setBacktesting(true);
+      setBacktestLogs([
+        "[SYSTEM] Spawning isolated backtester thread...",
+        "[SYSTEM] Requesting historical Klines from CEX API...",
+        "[SYSTEM] Replaying tick stream..."
+      ]);
       ws.current.send(JSON.stringify({
         action: "run_backtest",
         params: backtestParams
@@ -1002,10 +1010,24 @@ export default function App() {
             )}
 
             {backtesting && (
-              <div className="flex flex-col items-center justify-center p-24 border border-[#1E1E2F] rounded bg-[#0d0d0d]/60 text-center space-y-3.5">
-                <div className="w-6 h-6 rounded-full border-2 border-emerald-500 border-t-transparent animate-spin" />
-                <div className="text-emerald-400 font-mono text-[10px] uppercase tracking-widest animate-pulse">
-                  Replaying historical market Klines...
+              <div className="space-y-6">
+                <div className="flex flex-col items-center justify-center p-16 border border-[#1E1E2F] rounded bg-[#0d0d0d]/60 text-center space-y-3.5">
+                  <div className="w-6 h-6 rounded-full border-2 border-emerald-500 border-t-transparent animate-spin" />
+                  <div className="text-emerald-400 font-mono text-[10px] uppercase tracking-widest animate-pulse">
+                    Replaying historical market Klines...
+                  </div>
+                </div>
+                
+                {/* Backtest progress logs */}
+                <div className="bg-zinc-950/60 border border-[#1E1E2F]/80 rounded flex flex-col h-[200px]">
+                  <div className="px-4 py-2.5 border-b border-[#1E1E2F]/60">
+                    <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Simulation Decisional Telemetry Logs</span>
+                  </div>
+                  <div className="flex-grow p-4 overflow-y-auto font-mono text-xs leading-relaxed space-y-1.5 flex flex-col justify-start">
+                    {backtestLogs.map((log, idx) => (
+                      <div key={idx} className="text-slate-400">{log}</div>
+                    ))}
+                  </div>
                 </div>
               </div>
             )}
@@ -1048,6 +1070,29 @@ export default function App() {
 
                 {/* Equity Timeline SVG Chart */}
                 <SimulationChart data={backtestResults.equity_timeline} />
+
+                {/* Backtest Process Monitor Logs Console */}
+                <div className="bg-zinc-950/60 border border-[#1E1E2F]/80 rounded flex flex-col h-[280px]">
+                  <div className="px-4 py-2.5 border-b border-[#1E1E2F]/60 flex items-center justify-between">
+                    <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Simulation Decisional Telemetry Logs</span>
+                    <span className="text-[9px] font-mono text-slate-600 uppercase">ReadOnly Feed</span>
+                  </div>
+                  <div className="flex-grow p-4 overflow-y-auto font-mono text-xs leading-relaxed space-y-1.5 flex flex-col justify-start">
+                    {backtestLogs.map((log, idx) => {
+                      let styleClass = "text-slate-400";
+                      if (log.includes("[TRADE]")) styleClass = "text-emerald-400 font-semibold";
+                      else if (log.includes("[BLOCKED]")) styleClass = "text-slate-500";
+                      else if (log.includes("[SYSTEM]")) styleClass = "text-sky-400 font-medium";
+                      else if (log.includes("[DATA]")) styleClass = "text-amber-400/90";
+                      
+                      return (
+                        <div key={idx} className={styleClass}>
+                          {log}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
               </div>
             )}
           </div>
