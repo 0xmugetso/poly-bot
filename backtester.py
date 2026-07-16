@@ -2,7 +2,8 @@ import time
 import json
 import random
 import urllib.request
-from datetime import datetime, timezone
+import ssl
+from datetime import datetime, timezone, timedelta
 
 class Backtester:
     def __init__(self, start_date=None, end_date=None, proximity_limit=0.0002, obi_cutoff=0.65, base_size=10.0):
@@ -13,14 +14,14 @@ class Backtester:
         self.base_size = float(base_size)
         self.symbols = ["BTC", "ETH", "SOL", "XRP", "BNB"]
 
-    def fetch_binance_klines(self, symbol, limit=500):
-        """Fetches historical 1-minute candles from Binance REST API."""
+    def fetch_binance_klines(self, symbol, start_ms, end_ms, limit=1000):
+        """Fetches historical 1-minute candles from Binance REST API for a specific period."""
         try:
-            # Map symbol names to standard USDT pairs
             pair = f"{symbol}USDT"
-            url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval=1m&limit={limit}"
+            url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval=1m&startTime={start_ms}&endTime={end_ms}&limit={limit}"
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            res = urllib.request.urlopen(req, timeout=5).read()
+            ctx = ssl._create_unverified_context()
+            res = urllib.request.urlopen(req, timeout=3, context=ctx).read()
             data = json.loads(res)
             # Row format: [OpenTime, Open, High, Low, Close, Volume, CloseTime, ...]
             candles = []
@@ -36,15 +37,14 @@ class Backtester:
         except Exception:
             return None
 
-    def generate_monte_carlo_candles(self, symbol, start_price, limit=500):
-        """Generates high-fidelity synthetic candles as a fallback."""
+    def generate_monte_carlo_candles(self, symbol, start_price, start_ms, limit=1000):
+        """Generates high-fidelity synthetic candles starting from start_ms."""
         candles = []
         current_price = start_price
-        # Adjust volatilities matching current market states
         vols = {"BTC": 0.0005, "ETH": 0.0007, "SOL": 0.0012, "XRP": 0.0015, "BNB": 0.0008}
         vol = vols.get(symbol, 0.001)
         
-        t_now = int(time.time()) - (limit * 60)
+        t_start = start_ms // 1000
         for i in range(limit):
             op = current_price
             prices = [op]
@@ -57,7 +57,7 @@ class Backtester:
                 "high": max(prices),
                 "low": min(prices),
                 "close": cl,
-                "time": t_now + (i * 60)
+                "time": t_start + (i * 60)
             })
         return candles
 
@@ -75,24 +75,45 @@ class Backtester:
         losses = 0
         gross_revenue = 0.0
         
+        # Parse dates robustly
+        try:
+            dt_start = datetime.strptime(self.start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except Exception:
+            try:
+                dt_start = datetime.strptime(self.start_date, "%m/%d/%Y").replace(tzinfo=timezone.utc)
+            except Exception:
+                dt_start = datetime.now(timezone.utc) - timedelta(days=3)
+                
+        try:
+            dt_end = datetime.strptime(self.end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except Exception:
+            try:
+                dt_end = datetime.strptime(self.end_date, "%m/%d/%Y").replace(tzinfo=timezone.utc)
+            except Exception:
+                dt_end = datetime.now(timezone.utc)
+                
+        start_ms = int(dt_start.timestamp() * 1000)
+        end_ms = int(dt_end.timestamp() * 1000)
+        if end_ms <= start_ms:
+            end_ms = start_ms + (24 * 3600 * 1000) # 1 day default
+            
         logs = [
             "[SYSTEM] Initializing Backtester...",
-            f"[SYSTEM] Date range parameters: {self.start_date} to {self.end_date}",
+            f"[SYSTEM] Date range parameters: {dt_start.strftime('%Y-%m-%d')} to {dt_end.strftime('%Y-%m-%d')}",
             f"[SYSTEM] Proximity limit: {self.proximity_limit*100:.3f}% | OBI cutoff: {self.obi_cutoff:.2f} | Base size: ${self.base_size:.1f}"
         ]
         
         # We simulate over 5-minute boundaries
-        # Fetch 500 minutes of historical data (covers ~100 rounds of 5m intervals)
         symbol_candles = {}
         for sym in self.symbols:
-            candles = self.fetch_binance_klines(sym, limit=500)
+            candles = self.fetch_binance_klines(sym, start_ms, end_ms, limit=1000)
             if not candles:
                 # Fallback to Monte Carlo simulation
                 start_prices = {"BTC": 67000.0, "ETH": 3450.0, "SOL": 140.0, "XRP": 0.58, "BNB": 580.0}
-                candles = self.generate_monte_carlo_candles(sym, start_prices.get(sym, 10.0), limit=500)
-                logs.append(f"[DATA] Offline/Geoblocked. Generated 500 Monte Carlo candles for {sym}.")
+                candles = self.generate_monte_carlo_candles(sym, start_prices.get(sym, 10.0), start_ms, limit=1000)
+                logs.append(f"[DATA] Offline/Geoblocked. Generated 1000 Monte Carlo candles for {sym}.")
             else:
-                logs.append(f"[DATA] Fetched 500 historical candles for {sym} from Binance API.")
+                logs.append(f"[DATA] Fetched {len(candles)} historical candles for {sym} from Binance API.")
             symbol_candles[sym] = candles
         
         # Check data length
