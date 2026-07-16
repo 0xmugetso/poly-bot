@@ -130,6 +130,8 @@ export default function App() {
   const [clobClockOffset, setClobClockOffset] = useState(0.0);
   const [currentTimes, setCurrentTimes] = useState({ local: "", utc: "", clob: "" });
   const [userHasScrolledUp, setUserHasScrolledUp] = useState(false);
+  const [showConnectionConfig, setShowConnectionConfig] = useState(false);
+  const [customWsUrl, setCustomWsUrl] = useState(localStorage.getItem("custom_ws_url") || "");
   
   const ws = useRef(null);
   const consoleContainerRef = useRef(null);
@@ -144,7 +146,8 @@ export default function App() {
   }, []);
 
   const connectWS = () => {
-    const wsUrl = import.meta.env.VITE_WS_URL || "ws://localhost:8000";
+    const savedUrl = localStorage.getItem("custom_ws_url");
+    const wsUrl = savedUrl || import.meta.env.VITE_WS_URL || "ws://localhost:8000";
     ws.current = new WebSocket(wsUrl);
 
     ws.current.onopen = () => {
@@ -275,6 +278,20 @@ export default function App() {
     } else {
       addLocalSystemLog("Database CSV export failed: Connection is offline.");
     }
+  };
+
+  const handleSaveWsUrl = (newUrl) => {
+    if (newUrl) {
+      localStorage.setItem("custom_ws_url", newUrl);
+      addLocalSystemLog(`[CONFIG] Saved custom WebSocket URL: ${newUrl}`);
+    } else {
+      localStorage.removeItem("custom_ws_url");
+      addLocalSystemLog("[CONFIG] Cleared custom WebSocket URL. Reset to default.");
+    }
+    if (ws.current) {
+      ws.current.close();
+    }
+    setShowConnectionConfig(false);
   };
 
   // Scroll detection to let user read logs without snapping
@@ -439,10 +456,14 @@ export default function App() {
               {latencyMs.toFixed(2)} ms
             </span>
           </div>
-          <div className="flex items-center gap-1.5 text-xs font-mono text-slate-400">
-            <Wifi size={14} className="text-emerald-500" />
-            <span className="uppercase text-[10px]">{connected ? 'WS Linked' : 'WS Lost'}</span>
-          </div>
+          <button 
+            onClick={() => setShowConnectionConfig(true)}
+            className="flex items-center gap-1.5 text-xs font-mono text-slate-400 hover:text-slate-200 transition-colors border border-[#1E1E2F]/60 px-2 py-1 rounded bg-[#07070C]"
+            title="Configure Connection Settings"
+          >
+            <Wifi size={14} className={connected ? "text-emerald-500 animate-pulse" : "text-rose-500"} />
+            <span className="uppercase text-[9px]">{connected ? 'WS Linked' : 'WS Lost'}</span>
+          </button>
         </div>
 
         {/* KPI 4: Strategy Split */}
@@ -725,6 +746,55 @@ export default function App() {
           </div>
         </section>
       </div>
+      
+      {/* 7. Connection Settings Overlay Modal */}
+      {showConnectionConfig && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-6 max-w-sm w-full shadow-2xl space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-xs font-mono font-bold uppercase tracking-wider text-slate-200">
+                Connection Settings
+              </h3>
+              <button 
+                onClick={() => setShowConnectionConfig(false)}
+                className="text-xs font-mono text-slate-500 hover:text-slate-300"
+              >
+                [CLOSE]
+              </button>
+            </div>
+            <p className="text-[10px] font-mono text-slate-400 leading-relaxed">
+              Define your backend's secure WebSocket endpoint to stream trades and logs directly from your Railway host or local laptop.
+            </p>
+            <div className="space-y-1.5">
+              <label className="text-[9px] font-mono text-slate-500 uppercase block">WebSocket Endpoint URL</label>
+              <input 
+                type="text" 
+                value={customWsUrl} 
+                onChange={(e) => setCustomWsUrl(e.target.value)}
+                placeholder="ws://localhost:8000"
+                className="w-full bg-[#040407] border border-[#1E1E2F] rounded px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-sky-500"
+              />
+              <span className="text-[8px] font-mono text-slate-500 block leading-tight">
+                Enter your Railway domain (e.g. `wss://poly-bot-production.up.railway.app`) or leave empty to default to localhost.
+              </span>
+            </div>
+            <div className="flex gap-2 justify-end pt-1">
+              <button 
+                onClick={() => handleSaveWsUrl("")}
+                className="px-2.5 py-1.5 rounded border border-[#1E1E2F] hover:bg-slate-900 text-[10px] font-mono text-slate-400"
+              >
+                Reset Default
+              </button>
+              <button 
+                onClick={() => handleSaveWsUrl(customWsUrl)}
+                className="px-2.5 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-[10px] font-mono text-white"
+              >
+                Apply & Connect
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       
       {/* 6. System Footer */}
       <footer className="text-[10px] font-mono text-slate-500 border-t border-[#1E1E2F] mt-4 pt-3 flex items-center justify-between">
