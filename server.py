@@ -1149,9 +1149,33 @@ class TradingEngine:
         except Exception as e:
             return {"error": f"Backtest execution failed: {e}"}
 
-    async def http_handler(self, path, request_headers):
-        """Serves production built static React files from dist/ directory."""
-        if "Upgrade" in request_headers and request_headers["Upgrade"].lower() == "websocket":
+    async def http_handler(self, arg1, arg2):
+        """Serves production built static React files from dist/ directory.
+        Handles both old websockets (path, headers) and new websockets (connection, request) signatures.
+        """
+        if hasattr(arg2, "headers") and hasattr(arg2, "path"):
+            path = arg2.path
+            headers = arg2.headers
+        else:
+            path = arg1
+            headers = arg2
+            
+        is_websocket = False
+        if headers is not None:
+            try:
+                upgrade = headers.get("Upgrade", "")
+                if upgrade.lower() == "websocket":
+                    is_websocket = True
+            except Exception:
+                try:
+                    for k, v in headers:
+                        if k.lower() == "upgrade" and v.lower() == "websocket":
+                            is_websocket = True
+                            break
+                except Exception:
+                    pass
+                    
+        if is_websocket:
             return None # Proceed to websocket handler
             
         # Default to index.html for SPA router requests
