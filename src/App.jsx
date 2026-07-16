@@ -95,6 +95,8 @@ export default function App() {
   const [equityHistory, setEquityHistory] = useState([1420.55]);
   const [logFilter, setLogFilter] = useState("ALL"); // ALL, TRADES, BLOCKED, SYSTEM
   const [liveObi, setLiveObi] = useState({ BTC: 0.0, ETH: 0.0, SOL: 0.0, XRP: 0.0, BNB: 0.0 });
+  const [clobClockOffset, setClobClockOffset] = useState(0.0);
+  const [currentTimes, setCurrentTimes] = useState({ local: "", utc: "", clob: "" });
   
   const ws = useRef(null);
   const consoleContainerRef = useRef(null);
@@ -158,6 +160,7 @@ export default function App() {
       setRestingLimitOrders(data.resting_limit_orders || []);
       setPriorityGasGwei(data.priority_gas_gwei || 65);
       setMaticPrice(data.matic_price || 0.55);
+      setClobClockOffset(data.clob_clock_offset || 0.0);
 
       // Manage log streams
       if (!isPausedStream) {
@@ -192,6 +195,25 @@ export default function App() {
     try { return JSON.parse(str); }
     catch (e) { return null; }
   };
+
+  // Clock synchronization loop
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const now = new Date();
+      const localStr = now.toLocaleTimeString();
+      const utcStr = now.toISOString().slice(11, 19) + " UTC";
+      
+      const clobTime = new Date(now.getTime() + clobClockOffset * 1000);
+      const clobStr = clobTime.toISOString().slice(11, 19) + " CLOB";
+      
+      setCurrentTimes({
+        local: localStr,
+        utc: utcStr,
+        clob: clobStr
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [clobClockOffset]);
 
   const addLocalSystemLog = (msg) => {
     const timestamp = new Date().toLocaleTimeString();
@@ -292,6 +314,25 @@ export default function App() {
         </div>
 
         {/* Dynamic header info */}
+        {/* Clock Synchronizer Widget */}
+        <div className="hidden lg:flex items-center gap-5 text-[10px] font-mono border border-[#1E1E2F]/40 bg-[#07070C] px-3.5 py-2 rounded">
+          <div className="flex items-center gap-1.5">
+            <span className="w-1 h-1 rounded-full bg-slate-500" />
+            <span className="text-slate-500 uppercase">LOCAL:</span>
+            <span className="text-slate-300 font-semibold">{currentTimes.local || "00:00:00"}</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="w-1 h-1 rounded-full bg-sky-500" />
+            <span className="text-sky-500 uppercase">UTC (FEED):</span>
+            <span className="text-sky-300 font-semibold">{currentTimes.utc || "00:00:00 UTC"}</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="w-1 h-1 rounded-full bg-emerald-500" />
+            <span className="text-emerald-500 uppercase">CLOB SYNC:</span>
+            <span className="text-emerald-300 font-semibold">{currentTimes.clob || "00:00:00 CLOB"}</span>
+          </div>
+        </div>
+
         <div className="flex items-center gap-6">
           <div className="text-right hidden sm:block">
             <span className="text-[10px] text-slate-500 uppercase block font-mono">Simulated Wallet Balance</span>
@@ -308,27 +349,6 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2">
-            <button 
-              onClick={handleToggleStatus}
-              className={`px-3 py-1.5 rounded border text-xs font-medium transition-colors flex items-center gap-1.5 ${
-                status === 'RUNNING' 
-                  ? 'border-rose-900/50 bg-rose-950/20 text-rose-400 hover:bg-rose-950/40' 
-                  : 'border-emerald-900/50 bg-emerald-950/20 text-emerald-400 hover:bg-emerald-950/40'
-              }`}
-            >
-              {status === 'RUNNING' ? <Pause size={13} /> : <Play size={13} />}
-              {status === 'RUNNING' ? 'Pause Engine' : 'Resume Engine'}
-            </button>
-            
-            <button 
-              onClick={handleTriggerGas}
-              className="px-3 py-1.5 rounded border border-amber-900/50 bg-amber-950/20 text-amber-400 hover:bg-amber-950/40 text-xs font-medium transition-colors flex items-center gap-1.5"
-              title="Bump Gas Priority"
-            >
-              <Flame size={13} />
-              <span>Optimized Gas</span>
-            </button>
-
             <button 
               onClick={handleExportCsv}
               className="px-3 py-1.5 rounded border border-sky-900/50 bg-sky-950/20 text-sky-400 hover:bg-sky-950/40 text-xs font-medium transition-colors flex items-center gap-1.5"
@@ -527,7 +547,10 @@ export default function App() {
         {/* Left Panel: Live Activity Table */}
         <section className="bg-[#0D0D0D] border border-[#1E1E2F] rounded flex flex-col overflow-hidden">
           <div className="bg-black/40 border-b border-[#1E1E2F] px-4 py-3 flex items-center justify-between">
-            <h2 className="text-xs uppercase font-mono tracking-widest text-[#F8FAFC]">Live Activity Feed</h2>
+            <div className="flex items-baseline gap-2">
+              <h2 className="text-xs uppercase font-mono tracking-widest text-[#F8FAFC]">Live Activity Feed</h2>
+              <span className="text-[9px] text-slate-500 font-mono lowercase">(timestamps in UTC)</span>
+            </div>
             <span className="text-[10px] font-mono text-slate-500">Last 50 Trades</span>
           </div>
 
@@ -596,9 +619,12 @@ export default function App() {
         {/* Right Panel: Glassmorphic System Console */}
         <section className="console-panel rounded flex flex-col overflow-hidden">
           <div className="bg-black/40 border-b border-[#1E1E2F] px-4 py-3 flex items-center justify-between flex-wrap gap-2">
-            <h2 className="text-xs uppercase font-mono tracking-widest text-[#10B981] flex items-center gap-1.5">
-              <Cpu size={13} /> System Process Monitor
-            </h2>
+            <div className="flex items-baseline gap-2">
+              <h2 className="text-xs uppercase font-mono tracking-widest text-[#10B981] flex items-center gap-1.5">
+                <Cpu size={13} /> System Process Monitor
+              </h2>
+              <span className="text-[9px] text-slate-500 font-mono lowercase">(timestamps in server local time)</span>
+            </div>
             <div className="flex items-center gap-2">
               <div className="flex items-center border border-[#1E1E2F] rounded overflow-hidden">
                 {["ALL", "TRADES", "BLOCKED", "SYSTEM"].map((f) => (

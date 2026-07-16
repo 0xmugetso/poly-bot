@@ -367,7 +367,8 @@ class TradingEngine:
             "market_locks": self.market_locks,
             "resting_limit_orders": self.resting_limit_orders,
             "priority_gas_gwei": self.priority_gas_gwei,
-            "matic_price": self.matic_price
+            "matic_price": self.matic_price,
+            "clob_clock_offset": self.clob_clock_offset
         }
 
     async def broadcast(self):
