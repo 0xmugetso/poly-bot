@@ -250,7 +250,8 @@ class TradingEngine:
         self.env = os.environ.get("ENV", "SIMULATION")
         
         # Live market tracking
-        self.spot_prices = {"BTC": 67250.0, "ETH": 3480.0, "SOL": 142.50, "XRP": 0.58, "BNB": 585.0}
+        self.live_prices = {"BTC": 67250.0, "ETH": 3480.0, "SOL": 142.50, "XRP": 0.58, "BNB": 585.0}
+        self.spot_prices = self.live_prices
         self.price_decimals = {"BTC": 1, "ETH": 2, "SOL": 2, "XRP": 4, "BNB": 2}
         self.active_markets = {}  # symbol -> market_details
         
@@ -447,8 +448,8 @@ class TradingEngine:
                         if "s" in data and "c" in data:
                             ticker = data["s"]
                             price = float(data["c"])
-                            symbol = ticker.replace("USDT", "")
-                            self.spot_prices[symbol] = price
+                            symbol = ticker.replace("USDT", "").replace("USD", "")
+                            self.live_prices[symbol] = price
             except Exception as e:
                 err_str = str(e)
                 self.add_system_log(f"Binance WebSocket error: {err_str}")
@@ -744,8 +745,14 @@ class TradingEngine:
             
         shares = self.max_position_size_usdc / price
         priority_gas_gwei = self.priority_gas_gwei
-        spot = self.spot_prices[market["symbol"]]
-        strike = market["strike_price"]
+        spot = self.live_prices.get(market["symbol"], 0.0)
+        strike = market.get("strike_price", 0.0)
+        
+        # Strict validation pre-flight guard
+        if strike <= 0.0 or spot <= 0.0:
+            self.add_system_log(f"[WARNING] Aborting trade on {slug}: Strike or Spot price read failed (defaulted to 0.0)")
+            return
+            
         time_delta = float(market["close_time"]) - (time.time() + self.clob_clock_offset)
 
         if len(active_pools) >= self.max_simultaneous_trades and slug not in active_pools:
