@@ -502,7 +502,21 @@ class TradingEngine:
             data = json.loads(res)
             if len(data) > 0:
                 return data[0]
-        except Exception as e:
+        except Exception:
+            pass
+        return None
+
+    def fetch_market_details_fallback(self, slug):
+        """Queries active Polymarket markets to find a matching slug as a fallback."""
+        try:
+            url = "https://gamma-api.polymarket.com/markets?active=true&limit=100"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            res = urllib.request.urlopen(req, timeout=5).read()
+            data = json.loads(res)
+            for market in data:
+                if market.get("slug") == slug:
+                    return market
+        except Exception:
             pass
         return None
 
@@ -533,28 +547,54 @@ class TradingEngine:
                     self.add_system_log(f"Syncing active contract details for: {slug_5m}")
                     details = await asyncio.to_thread(self.fetch_market_details, slug_5m)
                     
+                    if not details:
+                        # Fallback logic loop: refresh from Gamma /markets wrapper
+                        self.add_system_log(f"Gamma slug query empty. Triggering active markets cache refresh fallback for {slug_5m}...")
+                        details = await asyncio.to_thread(self.fetch_market_details_fallback, slug_5m)
+                        
                     if details:
-                        # Record the strike price (the spot price at the start of the round)
-                        # We fall back to current spot price if not available
-                        strike = self.spot_prices[symbol]
-                        self.active_markets[slug_5m] = {
-                            "symbol": symbol,
-                            "slug": slug_5m,
-                            "type": "5M",
-                            "start_time": t_rounded_5m,
-                            "close_time": close_time,
-                            "strike_price": strike,
-                            "id": details.get("id"),
-                            "clobTokenIds": json.loads(details.get("clobTokenIds", "[]")),
-                            "conditionId": details.get("conditionId"),
-                            "last_evaluated": 0,
-                            "resolved": False,
-                            "blocked_logged": False
-                        }
-                        self.add_system_log(f"Market Active: {slug_5m} | Strike Price Set: ${strike:,.2f}")
+                        # Extract suffix and asset from details slug
+                        details_slug = details.get("slug", "")
+                        try:
+                            slug_parts = details_slug.split("-")
+                            details_suffix = int(slug_parts[-1])
+                            details_asset = slug_parts[0].upper()
+                        except Exception:
+                            details_suffix = 0
+                            details_asset = ""
+                            
+                        # Strict matching: Suffix must match active round time, and Asset must match symbol
+                        if details_suffix == t_rounded_5m and details_asset == symbol:
+                            # Extract real strike price from line, strike, or question text
+                            strike_val = details.get("line") or details.get("strike")
+                            if not strike_val:
+                                import re
+                                question = details.get("question", "")
+                                match = re.search(r"\$(\d+(?:\.\d+)?)", question)
+                                if match:
+                                    strike_val = float(match.group(1))
+                                    
+                            strike = float(strike_val) if strike_val else self.spot_prices[symbol]
+                            
+                            self.active_markets[slug_5m] = {
+                                "symbol": symbol,
+                                "slug": slug_5m,
+                                "type": "5M",
+                                "start_time": t_rounded_5m,
+                                "close_time": close_time,
+                                "strike_price": strike,
+                                "id": details.get("id"),
+                                "clobTokenIds": json.loads(details.get("clobTokenIds", "[]")) if isinstance(details.get("clobTokenIds"), str) else details.get("clobTokenIds", []),
+                                "conditionId": details.get("conditionId"),
+                                "last_evaluated": 0,
+                                "resolved": False,
+                                "blocked_logged": False
+                            }
+                            self.add_system_log(f"Market Active: {slug_5m} | Strike Price Set: ${strike:,.2f}")
+                        else:
+                            self.add_system_log(f"[WARNING] Stale or misaligned contract details returned for {slug_5m}: asset={details_asset}, suffix={details_suffix}. Ignored.")
                     else:
                         # Fallback mock details if the live round isn't created on Gamma API yet
-                        # (Helps keep the engine alive offline or during API delay)
                         strike = self.spot_prices[symbol]
                         self.active_markets[slug_5m] = {
                             "symbol": symbol,
@@ -578,6 +618,17 @@ class TradingEngine:
                     
                 time_remaining = market["close_time"] - t
                 symbol = market["symbol"]
+                
+                # Verify that contract substring token asset == Binance inbound asset
+                try:
+                    contract_asset = slug.split("-")[0].upper()
+                except Exception:
+                    contract_asset = ""
+                    
+                if contract_asset != symbol:
+                    self.add_system_log(f"[ERROR] Asset mismatch: Contract asset '{contract_asset}' != feed asset '{symbol}'. Execution aborted.")
+                    continue
+                    
                 spot = self.spot_prices[symbol]
                 strike = market["strike_price"]
                 
