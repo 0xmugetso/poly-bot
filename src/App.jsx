@@ -94,6 +94,97 @@ function Sparkline({ data }) {
   );
 }
 
+// Custom responsive high-fidelity SVG timeline graph for backtest equity curves
+function SimulationChart({ data }) {
+  if (!data || data.length < 2) return null;
+  const equities = data.map(d => d.equity);
+  const min = Math.min(...equities);
+  const max = Math.max(...equities);
+  const range = max - min === 0 ? 1 : max - min;
+  
+  const width = 600;
+  const height = 240;
+  const paddingLeft = 45;
+  const paddingRight = 10;
+  const paddingTop = 15;
+  const paddingBottom = 25;
+  
+  const chartWidth = width - paddingLeft - paddingRight;
+  const chartHeight = height - paddingTop - paddingBottom;
+  
+  const points = data.map((d, i) => {
+    const x = paddingLeft + (i / (data.length - 1)) * chartWidth;
+    const y = paddingTop + chartHeight - ((d.equity - min) / range) * chartHeight;
+    return `${x},${y}`;
+  }).join(" ");
+  
+  const fillPoints = `${paddingLeft},${paddingTop + chartHeight} ` + points + ` ${width - paddingRight},${paddingTop + chartHeight}`;
+  
+  const gridCount = 4;
+  const gridLines = [];
+  for (let i = 0; i <= gridCount; i++) {
+    const val = min + (i / gridCount) * range;
+    const y = paddingTop + chartHeight - (i / gridCount) * chartHeight;
+    gridLines.push({ y, val });
+  }
+  
+  return (
+    <div className="w-full bg-zinc-950/60 border border-[#1E1E2F]/80 rounded p-4">
+      <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider block mb-3">Equity Growth Timeline (USDC)</span>
+      <svg viewBox={`0 0 ${width} ${height}`} className="w-full overflow-visible">
+        <defs>
+          <linearGradient id="equityGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#10B981" stopOpacity="0.3" />
+            <stop offset="100%" stopColor="#10B981" stopOpacity="0.0" />
+          </linearGradient>
+        </defs>
+        
+        {/* Grid Lines */}
+        {gridLines.map((line, idx) => (
+          <g key={idx}>
+            <line 
+              x1={paddingLeft} 
+              y1={line.y} 
+              x2={width - paddingRight} 
+              y2={line.y} 
+              stroke="#1E1E2F" 
+              strokeWidth="0.8" 
+              strokeDasharray="4 4" 
+            />
+            <text 
+              x={paddingLeft - 8} 
+              y={line.y + 3} 
+              fill="#64748B" 
+              fontSize="8" 
+              fontFamily="monospace" 
+              textAnchor="end"
+            >
+              ${line.val.toFixed(0)}
+            </text>
+          </g>
+        ))}
+        
+        {/* Area Fill */}
+        <polyline
+          fill="url(#equityGrad)"
+          stroke="none"
+          points={fillPoints}
+        />
+        
+        {/* Line Path */}
+        <polyline
+          fill="none"
+          stroke="#10B981"
+          strokeWidth="1.8"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          points={points}
+        />
+      </svg>
+    </div>
+  );
+}
+
 export default function App() {
   // Local state mirrored from WebSocket
   const [wallet, setWallet] = useState(1420.55);
@@ -132,6 +223,16 @@ export default function App() {
   const [userHasScrolledUp, setUserHasScrolledUp] = useState(false);
   const [showConnectionConfig, setShowConnectionConfig] = useState(false);
   const [customWsUrl, setCustomWsUrl] = useState(localStorage.getItem("custom_ws_url") || "");
+  const [activeTab, setActiveTab] = useState("live");
+  const [backtestParams, setBacktestParams] = useState({
+    startDate: new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString().slice(0, 10),
+    endDate: new Date().toISOString().slice(0, 10),
+    proximityLimit: 0.02,
+    obiCutoff: 0.65,
+    baseSize: 10.0
+  });
+  const [backtestResults, setBacktestResults] = useState(null);
+  const [backtesting, setBacktesting] = useState(false);
   
   const ws = useRef(null);
   const consoleContainerRef = useRef(null);
@@ -172,6 +273,17 @@ export default function App() {
         link.click();
         document.body.removeChild(link);
         addLocalSystemLog(`[EXPORT] Database snapshot downloaded: ${filename}`);
+        return;
+      }
+
+      if (data.type === "backtest_results") {
+        setBacktesting(false);
+        if (data.results.error) {
+          addLocalSystemLog(`[SIMULATION ERROR] ${data.results.error}`);
+        } else {
+          setBacktestResults(data.results);
+          addLocalSystemLog(`[SIMULATION COMPLETED] Net PnL: $${data.results.net_profit} USDC | Win Rate: ${data.results.win_rate}%`);
+        }
         return;
       }
 
@@ -282,6 +394,19 @@ export default function App() {
     }
   };
 
+  const handleRunBacktest = () => {
+    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+      setBacktesting(true);
+      ws.current.send(JSON.stringify({
+        action: "run_backtest",
+        params: backtestParams
+      }));
+      addLocalSystemLog("Spawning isolated historical backtesting simulation...");
+    } else {
+      addLocalSystemLog("Backtest execution failed: Connection is offline.");
+    }
+  };
+
   const handleSaveWsUrl = (newUrl) => {
     if (newUrl) {
       localStorage.setItem("custom_ws_url", newUrl);
@@ -359,17 +484,41 @@ export default function App() {
     <div className="min-h-screen bg-[#09090B] text-slate-100 p-4 font-sans select-none flex flex-col justify-between">
       {/* 1. Header Bar */}
       <header className="flex items-center justify-between border-b border-[#1E1E2F] pb-4 mb-4">
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-6">
           <div className="relative flex items-center justify-center">
             <span className={`w-3.5 h-3.5 rounded-full ${status === 'RUNNING' && connected ? 'bg-emerald-500 pulse-green' : 'bg-rose-500'}`} />
           </div>
           <div className="flex flex-col">
             <h1 className="text-lg font-bold tracking-widest text-[#F8FAFC]">
-              POLY-BOT <span className="text-[#10B981]">//</span> LIVE
+              POLY-BOT <span className="text-[#10B981]">//</span> {activeTab === "live" ? "LIVE" : "SIM"}
             </h1>
             <span className="text-[10px] uppercase font-mono tracking-wider text-slate-500">
               Web3 Latency Arbitrage & Sweeper
             </span>
+          </div>
+          
+          {/* Tab selector pills */}
+          <div className="flex bg-[#040407] border border-[#1E1E2F] p-0.5 rounded gap-0.5 font-mono text-[9px] uppercase tracking-wider">
+            <button 
+              onClick={() => setActiveTab("live")}
+              className={`px-3 py-1 rounded transition-colors ${
+                activeTab === "live" 
+                  ? "bg-slate-800 text-slate-200 font-bold" 
+                  : "text-slate-500 hover:text-slate-300"
+              }`}
+            >
+              Live Terminal
+            </button>
+            <button 
+              onClick={() => setActiveTab("backtest")}
+              className={`px-3 py-1 rounded transition-colors ${
+                activeTab === "backtest" 
+                  ? "bg-slate-800 text-slate-200 font-bold" 
+                  : "text-slate-500 hover:text-slate-300"
+              }`}
+            >
+              Backtest & Sim
+            </button>
           </div>
         </div>
 
@@ -421,343 +570,487 @@ export default function App() {
         </div>
       </header>
 
-      {/* 2. Metrics Grid */}
-      <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
-        {/* KPI 1: Net PnL 24h & Sparkline */}
-        <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex items-center justify-between hover:bg-[#121216] transition-colors">
-          <div className="flex flex-col gap-1">
-            <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Net PnL (24h)</span>
-            <span className={`text-xl font-mono-val font-bold ${netPnlUsdc >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-              {netPnlPct >= 0 ? '+' : ''}{netPnlPct.toFixed(2)}%
-            </span>
-          </div>
-          <div className="h-10">
-            <Sparkline data={equityHistory} />
-          </div>
-        </div>
-
-        {/* KPI 2: Win Rate */}
-        <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex items-center justify-between hover:bg-[#121216] transition-colors">
-          <div className="flex flex-col gap-1">
-            <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Win Rate</span>
-            <span className="text-xl font-mono-val font-bold text-emerald-400">
-              {winRateVal}%
-            </span>
-          </div>
-          <div className="flex flex-col items-end text-xs font-mono text-slate-400">
-            <span className="text-emerald-500">{wins} Wins</span>
-            <span className="text-rose-500">{losses} Losses</span>
-          </div>
-        </div>
-
-        {/* KPI 3: Websocket Latency */}
-        <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex items-center justify-between hover:bg-[#121216] transition-colors">
-          <div className="flex flex-col gap-1">
-            <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Avg Latency</span>
-            <span className={`text-xl font-mono-val font-bold ${latencyMs < 5.0 ? 'text-emerald-400' : 'text-amber-400'}`}>
-              {latencyMs.toFixed(2)} ms
-            </span>
-          </div>
-          <button 
-            onClick={() => setShowConnectionConfig(true)}
-            className="flex items-center gap-1.5 text-xs font-mono text-slate-400 hover:text-slate-200 transition-colors border border-[#1E1E2F]/60 px-2 py-1 rounded bg-[#07070C]"
-            title="Configure Connection Settings"
-          >
-            <Wifi size={14} className={connected ? "text-emerald-500 animate-pulse" : "text-rose-500"} />
-            <span className="uppercase text-[9px]">{connected ? 'WS Linked' : 'WS Lost'}</span>
-          </button>
-        </div>
-
-        {/* KPI 4: Strategy Split */}
-        <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex items-center justify-between hover:bg-[#121216] transition-colors">
-          <div className="flex flex-col gap-1">
-            <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Strategy Split</span>
-            <span className="text-xl font-mono-val font-bold text-slate-200">
-              0% / 100%
-            </span>
-          </div>
-          <div className="flex flex-col items-end text-[10px] font-mono text-slate-400 uppercase">
-            <span>Arb: 0</span>
-            <span>Penny: {pennyWins + arbitrageWins}</span>
-          </div>
-        </div>
-      </section>
-
-      {/* 3. Spot Prices & OBI Strip */}
-      <section className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-3 mb-4 flex flex-wrap gap-4 items-center justify-around">
-        {Object.entries(spotPrices).map(([sym, price]) => {
-          const obi = liveObi[sym] || 0.0;
-          let obiColor = "text-slate-400";
-          if (obi > 0.65) obiColor = "text-emerald-400 font-bold";
-          else if (obi < -0.65) obiColor = "text-rose-400 font-bold";
-          return (
-            <div key={sym} className="flex flex-col items-center p-2 rounded bg-zinc-950/40 border border-[#1E1E2F]/40 w-[150px] flex-shrink-0">
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-slate-500">{sym}</span>
-                <span className="font-mono-val text-sm font-semibold text-slate-200">
-                  <AnimatedValue value={price} format={(v) => `$${v.toLocaleString(undefined, { minimumFractionDigits: PRICE_DECIMALS[sym] || 2 })}`} colorType="directional" />
+      {activeTab === "live" ? (
+        <>
+          {/* 2. Metrics Grid */}
+          <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+            {/* KPI 1: Net PnL 24h & Sparkline */}
+            <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex items-center justify-between hover:bg-[#121216] transition-colors">
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Net PnL (24h)</span>
+                <span className={`text-xl font-mono-val font-bold ${netPnlUsdc >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {netPnlPct >= 0 ? '+' : ''}{netPnlPct.toFixed(2)}%
                 </span>
               </div>
-              <div className="flex items-center gap-1.5 mt-1 text-[9px] font-mono">
-                <span className="text-slate-500">OBI:</span>
-                <span className={obiColor}>
-                  <AnimatedValue value={obi} format={(v) => `${v > 0 ? "+" : ""}${v.toFixed(3)}`} colorType="directional" />
+              <div className="h-10">
+                <Sparkline data={equityHistory} />
+              </div>
+            </div>
+
+            {/* KPI 2: Win Rate */}
+            <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex items-center justify-between hover:bg-[#121216] transition-colors">
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Win Rate</span>
+                <span className="text-xl font-mono-val font-bold text-emerald-400">
+                  {winRateVal}%
                 </span>
               </div>
-            </div>
-          );
-        })}
-      </section>
-
-      {/* 3.5 State Ledger and Gas Tracker Strip */}
-      <section className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
-        {/* Gas Tracker widget */}
-        <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col justify-between">
-          <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Polygon Gas Tracker</span>
-          <div className="flex items-baseline gap-2 mt-1">
-            <span className="text-2xl font-mono-val font-bold text-amber-400">
-              <AnimatedValue value={priorityGasGwei} format={(v) => `${v} Gwei`} colorType="simple" />
-            </span>
-            <span className="text-xs font-mono text-slate-400">Est. Tx: ${(150000 * priorityGasGwei * 1e-9 * maticPrice).toFixed(4)} USDC</span>
-          </div>
-          <div className="text-[10px] font-mono text-slate-500 uppercase mt-1">
-            Matic Reference: ${maticPrice.toFixed(2)} USDC
-          </div>
-        </div>
-
-        {/* State locks Ledger widget */}
-        <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 lg:col-span-2 flex flex-col justify-between">
-          <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Mutual Exclusion State Ledger</span>
-          <div className="flex flex-wrap gap-2 mt-2">
-            {Object.entries(marketLocks).map(([slug, lockState]) => (
-              <span key={slug} className="text-[10px] font-mono bg-rose-950/40 text-rose-400 border border-rose-900/50 px-2.5 py-1 rounded-full uppercase flex items-center gap-1.5 animate-pulse">
-                <span className="w-1.5 h-1.5 bg-rose-500 rounded-full" />
-                {slug.split('-')[0].toUpperCase()}: LOCKED (STRATEGY A)
-              </span>
-            ))}
-            {restingLimitOrders.map((order) => (
-              <span key={order.tx_hash} className="text-[10px] font-mono bg-blue-950/40 text-blue-400 border border-blue-900/50 px-2.5 py-1 rounded-full uppercase flex items-center gap-1.5">
-                <span className="w-1.5 h-1.5 bg-blue-500 rounded-full animate-pulse" />
-                {order.slug.split('-')[0].toUpperCase()}: LIMIT BUY {order.outcome} @ ${order.price}
-              </span>
-            ))}
-            {Object.keys(marketLocks).length === 0 && restingLimitOrders.length === 0 && (
-              <span className="text-xs font-mono text-slate-500 font-medium">
-                No active market locks or resting orders. Safe execution mode active.
-              </span>
-            )}
-          </div>
-          <div className="text-[10px] font-mono text-slate-500 uppercase mt-1">
-            Prevents dual-side Strategy A/B triggers on identical intervals.
-          </div>
-        </div>
-      </section>
-
-      {/* 4. Active Scan Tracker (Rolling lists of active contracts) */}
-      <section className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 mb-4">
-        <h3 className="text-xs uppercase font-mono tracking-widest text-[#10B981] mb-3 flex items-center gap-1.5">
-          <Activity size={12} /> Active Scanned Markets
-        </h3>
-        
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
-          {activeMarkets.map((market) => {
-            let statusColor = "bg-emerald-500 pulse-green";
-            let statusText = "STABLE";
-            if (marketLocks[market.slug]) {
-              statusColor = "bg-rose-500 pulse-red";
-              statusText = "LOCKED";
-            } else if (market.price_yes <= 0.05 || market.price_yes >= 0.95) {
-              statusColor = "bg-amber-500 pulse-orange";
-              statusText = "VOLATILE";
-            }
-
-            return (
-              <div key={market.slug} className="border border-[#1E1E2F] rounded bg-black/40 p-3 flex flex-col gap-2">
-                <div className="flex items-center justify-between border-b border-[#1E1E2F]/60 pb-1.5">
-                  <div className="flex items-center gap-1.5">
-                    <span className={`w-2 h-2 rounded-full ${statusColor}`} title={`Status: ${statusText}`} />
-                    <span className="text-xs font-bold text-slate-200">{market.symbol} ({market.type})</span>
-                  </div>
-                  <span className={`text-[10px] font-mono font-medium px-1.5 py-0.5 rounded ${
-                    market.time_remaining <= 5 ? 'bg-rose-950/40 text-rose-400 border border-rose-900/40' : 'bg-slate-900 text-slate-400'
-                  }`}>
-                    T-{market.time_remaining}s
-                  </span>
-                </div>
-                
-                <div className="text-[10px] font-mono flex flex-col gap-1 text-slate-400">
-                  <div className="flex justify-between">
-                    <span>Strike:</span>
-                    <span className="text-slate-200">${market.strike_price.toLocaleString(undefined, { minimumFractionDigits: PRICE_DECIMALS[market.symbol] || 2 })}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>YES (Up) Ask:</span>
-                    <span className="text-[#10B981] font-semibold">${market.price_yes}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>NO (Down) Ask:</span>
-                    <span className="text-rose-400 font-semibold">${market.price_no}</span>
-                  </div>
-                </div>
+              <div className="flex flex-col items-end text-xs font-mono text-slate-400">
+                <span className="text-emerald-500">{wins} Wins</span>
+                <span className="text-rose-500">{losses} Losses</span>
               </div>
-            );
-          })}
-          {activeMarkets.length === 0 && (
-            <div className="col-span-full text-center py-6 text-xs text-slate-500 font-mono">
-              [ SCANNING POLYMARKET FOR ACTIVE ROUNDS... ]
             </div>
-          )}
-        </div>
-      </section>
 
-      {/* 5. Main Double Panel (Activity Feed + System Console) */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 flex-grow h-[460px]">
-        {/* Left Panel: Live Activity Table */}
-        <section className="bg-[#0D0D0D] border border-[#1E1E2F] rounded flex flex-col overflow-hidden">
-          <div className="bg-black/40 border-b border-[#1E1E2F] px-4 py-3 flex items-center justify-between">
-            <div className="flex items-baseline gap-2">
-              <h2 className="text-xs uppercase font-mono tracking-widest text-[#F8FAFC]">Live Activity Feed</h2>
-              <span className="text-[9px] text-slate-500 font-mono lowercase">(timestamps in UTC)</span>
-            </div>
-            <span className="text-[10px] font-mono text-slate-500">Last 50 Trades</span>
-          </div>
-
-          <div className="flex-grow overflow-y-auto">
-            <table className="w-full border-collapse text-left text-xs font-mono">
-              <thead className="sticky top-0 bg-[#0D0D0D] border-b border-[#1E1E2F]/80 text-slate-400 text-[10px] uppercase tracking-wider">
-                <tr>
-                  <th className="px-4 py-2.5 font-medium">Time (UTC)</th>
-                  <th className="px-4 py-2.5 font-medium">Market</th>
-                  <th className="px-4 py-2.5 font-medium">Side</th>
-                  <th className="px-4 py-2.5 font-medium text-right">Price</th>
-                  <th className="px-4 py-2.5 font-medium text-right">Size</th>
-                  <th className="px-4 py-2.5 font-medium text-center">Status</th>
-                  <th className="px-4 py-2.5 font-medium text-right">Hash</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[#1E1E2F]/40">
-                {getAggregatedActivityLog().reverse().map((act) => {
-                  let badgeClass = "bg-amber-950/20 text-amber-400 border border-amber-900/30";
-                  if (act.status === "WIN") badgeClass = "bg-emerald-950/20 text-emerald-400 border border-emerald-900/30";
-                  if (act.status === "LOSS") badgeClass = "bg-rose-950/20 text-rose-400 border border-rose-900/30";
-                  if (act.status === "BLOCKED") badgeClass = "bg-slate-950/20 text-slate-500 border border-slate-900/30";
-                  
-                  const dt = new Date(act.datetime_utc);
-                  const timeStr = dt.toISOString().substr(11, 8);
-                  const mktSymbol = act.slug.split('-')[0].toUpperCase();
-                  const mktInterval = act.slug.includes('-5m-') ? '5M' : '15M';
-                  const isBlocked = act.status === "BLOCKED";
-
-                  return (
-                    <tr key={act.tx_hash} className={`hover:bg-[#121216]/50 transition-colors ${isBlocked ? 'text-slate-500/80 bg-slate-950/20' : ''}`}>
-                      <td className="px-4 py-2.5 text-slate-500">{timeStr}</td>
-                      <td className={`px-4 py-2.5 font-bold ${isBlocked ? 'text-slate-500' : 'text-slate-300'}`}>{mktSymbol}-{mktInterval}</td>
-                      <td className="px-4 py-2.5 text-slate-500">BUY {act.outcome}</td>
-                      <td className={`px-4 py-2.5 text-right font-semibold ${isBlocked ? 'text-slate-500' : 'text-slate-200'}`}>
-                        {isBlocked ? "—" : `$${act.price.toFixed(3)}`}
-                      </td>
-                      <td className={`px-4 py-2.5 text-right ${isBlocked ? 'text-slate-500' : 'text-slate-300'}`}>
-                        {isBlocked ? "—" : act.size.toLocaleString(undefined, { maximumFractionDigits: 1 })}
-                      </td>
-                      <td className="px-4 py-2.5 text-center">
-                        <span className={`text-[10px] px-2 py-0.5 rounded font-bold ${badgeClass}`}>
-                          {act.status}
-                        </span>
-                      </td>
-                      <td className="px-4 py-2.5 text-right">
-                        {isBlocked ? (
-                          <span className="text-slate-600 select-none">—</span>
-                        ) : (
-                          <a 
-                            href={`https://polygonscan.com/tx/${act.tx_hash}`} 
-                            target="_blank" 
-                            rel="noreferrer"
-                            className="text-slate-500 hover:text-[#10B981] flex items-center justify-end gap-1.5"
-                          >
-                            <span>{act.tx_hash.substr(0, 6)}</span>
-                            <ExternalLink size={10} />
-                          </a>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-                {getAggregatedActivityLog().length === 0 && (
-                  <tr>
-                    <td colSpan="7" className="text-center py-16 text-slate-500">
-                      [ WAITING FOR SYSTEM TRADING TRIGGERS... ]
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        {/* Right Panel: Glassmorphic System Console */}
-        <section className="console-panel rounded flex flex-col overflow-hidden">
-          <div className="bg-black/40 border-b border-[#1E1E2F] px-4 py-3 flex items-center justify-between flex-wrap gap-2">
-            <div className="flex items-baseline gap-2">
-              <h2 className="text-xs uppercase font-mono tracking-widest text-[#10B981] flex items-center gap-1.5">
-                <Cpu size={13} /> System Process Monitor
-              </h2>
-              <span className="text-[9px] text-slate-500 font-mono lowercase">(timestamps in server local time)</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="flex items-center border border-[#1E1E2F] rounded overflow-hidden">
-                {["ALL", "TRADES", "BLOCKED", "SYSTEM"].map((f) => (
-                  <button
-                    key={f}
-                    onClick={() => setLogFilter(f)}
-                    className={`px-2 py-1 text-[9px] font-mono transition-colors ${
-                      logFilter === f 
-                        ? 'bg-[#10B981] text-black font-bold' 
-                        : 'bg-slate-950 text-slate-400 hover:bg-slate-900 border-r border-[#1E1E2F]/45 last:border-0'
-                    }`}
-                  >
-                    {f}
-                  </button>
-                ))}
+            {/* KPI 3: Websocket Latency */}
+            <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex items-center justify-between hover:bg-[#121216] transition-colors">
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Avg Latency</span>
+                <span className={`text-xl font-mono-val font-bold ${latencyMs < 5.0 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                  {latencyMs.toFixed(2)} ms
+                </span>
               </div>
               <button 
-                onClick={() => setIsPausedStream(prev => !prev)}
-                className={`px-2 py-1 rounded border text-[10px] font-mono transition-colors ${
-                  isPausedStream 
-                    ? 'border-amber-900/50 bg-amber-950/20 text-amber-400' 
-                    : 'border-[#1E1E2F] bg-slate-900 text-slate-400 hover:bg-slate-800'
-                }`}
+                onClick={() => setShowConnectionConfig(true)}
+                className="flex items-center gap-1.5 text-xs font-mono text-slate-400 hover:text-slate-200 transition-colors border border-[#1E1E2F]/60 px-2 py-1 rounded bg-[#07070C]"
+                title="Configure Connection Settings"
               >
-                {isPausedStream ? 'Resume' : 'Pause'}
+                <Wifi size={14} className={connected ? "text-emerald-500 animate-pulse" : "text-rose-500"} />
+                <span className="uppercase text-[9px]">{connected ? 'WS Linked' : 'WS Lost'}</span>
               </button>
             </div>
-          </div>
 
-          <div 
-            ref={consoleContainerRef} 
-            onScroll={handleConsoleScroll}
-            className="flex-grow p-4 overflow-y-auto font-mono text-xs leading-relaxed space-y-1.5 flex flex-col justify-start"
-          >
-            {filteredLogs.map((log, idx) => {
-              let styleClass = "text-slate-400";
-              if (log.includes("[MAKER LIMIT POSTED]")) styleClass = "text-amber-400 font-medium";
-              else if (log.includes("[MAKER LIMIT FILLED]")) styleClass = "text-emerald-400 font-bold";
-              else if (log.includes("Arbitrage window") || log.includes("Executing BUY")) styleClass = "text-[#10B981] font-bold";
-              else if (log.includes("WIN") || log.includes("filled") || log.includes("[Limit Filled]")) styleClass = "text-emerald-400 font-semibold";
-              else if (log.includes("LOSS") || log.includes("blocked") || log.includes("exceeds") || log.includes("[Blocked]")) styleClass = "text-rose-400";
-              else if (log.includes("Round Settled") || log.includes("Market Active") || log.includes("LOCKED")) styleClass = "text-slate-200 font-semibold";
-              
+            {/* KPI 4: Strategy Split */}
+            <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex items-center justify-between hover:bg-[#121216] transition-colors">
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Strategy Split</span>
+                <span className="text-xl font-mono-val font-bold text-slate-200">
+                  0% / 100%
+                </span>
+              </div>
+              <div className="flex flex-col items-end text-[10px] font-mono text-slate-400 uppercase">
+                <span>Arb: 0</span>
+                <span>Penny: {pennyWins + arbitrageWins}</span>
+              </div>
+            </div>
+          </section>
+
+          {/* 3. Spot Prices & OBI Strip */}
+          <section className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-3 mb-4 flex flex-wrap gap-4 items-center justify-around">
+            {Object.entries(spotPrices).map(([sym, price]) => {
+              const obi = liveObi[sym] || 0.0;
+              let obiColor = "text-slate-400";
+              if (obi > 0.65) obiColor = "text-emerald-400 font-bold";
+              else if (obi < -0.65) obiColor = "text-rose-400 font-bold";
               return (
-                <div key={idx} className={styleClass}>
-                  {log}
+                <div key={sym} className="flex flex-col items-center p-2 rounded bg-zinc-950/40 border border-[#1E1E2F]/40 w-[150px] flex-shrink-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-slate-500">{sym}</span>
+                    <span className="font-mono-val text-sm font-semibold text-slate-200">
+                      <AnimatedValue value={price} format={(v) => `$${v.toLocaleString(undefined, { minimumFractionDigits: PRICE_DECIMALS[sym] || 2 })}`} colorType="directional" />
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 mt-1 text-[9px] font-mono">
+                    <span className="text-slate-500">OBI:</span>
+                    <span className={obiColor}>
+                      <AnimatedValue value={obi} format={(v) => `${v > 0 ? "+" : ""}${v.toFixed(3)}`} colorType="directional" />
+                    </span>
+                  </div>
                 </div>
               );
             })}
-            {filteredLogs.length === 0 && (
-              <div className="text-slate-500 italic text-center py-16">[ No logs matching current filter ]</div>
+          </section>
+
+          {/* 3.5 State Ledger and Gas Tracker Strip */}
+          <section className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
+            {/* Gas Tracker widget */}
+            <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col justify-between">
+              <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Polygon Gas Tracker</span>
+              <div className="flex items-baseline gap-2 mt-1">
+                <span className="text-2xl font-mono-val font-bold text-amber-400">
+                  <AnimatedValue value={priorityGasGwei} format={(v) => `${v} Gwei`} colorType="simple" />
+                </span>
+                <span className="text-xs font-mono text-slate-400">Est. Tx: ${(150000 * priorityGasGwei * 1e-9 * maticPrice).toFixed(4)} USDC</span>
+              </div>
+              <div className="text-[10px] font-mono text-slate-500 uppercase mt-1">
+                Base Fee: {(priorityGasGwei * 0.95).toFixed(0)} | Priority: {(priorityGasGwei * 0.05).toFixed(1)}
+              </div>
+            </div>
+
+            {/* Strategy Parameter Ledger */}
+            <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 lg:col-span-2 flex flex-col justify-between">
+              <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider mb-1">State Engine Parameter Ledger</span>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-1.5 font-mono text-xs text-slate-400">
+                <div className="flex flex-col">
+                  <span className="text-[9px] text-slate-500 uppercase">Proximity Limit</span>
+                  <span className="text-slate-200 font-bold">0.02%</span>
+                </div>
+                <div className="flex flex-col">
+                  <span className="text-[9px] text-slate-500 uppercase">Sweep Gate</span>
+                  <span className="text-slate-200 font-bold">OBI &gt; 0.65</span>
+                </div>
+                <div className="flex flex-col">
+                  <span className="text-[9px] text-slate-500 uppercase">Max Size</span>
+                  <span className="text-slate-200 font-bold">$0.10 USDC</span>
+                </div>
+                <div className="flex flex-col">
+                  <span className="text-[9px] text-slate-500 uppercase">CLOB Time Limit</span>
+                  <span className="text-slate-200 font-bold">0.5s</span>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* 4. Active Scan Tracker (Rolling lists of active contracts) */}
+          <section className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 mb-4">
+            <h3 className="text-xs uppercase font-mono tracking-widest text-[#10B981] mb-3 flex items-center gap-1.5">
+              <Activity size={12} /> Active Scanned Markets
+            </h3>
+            
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
+              {activeMarkets.map((market) => {
+                let statusColor = "bg-emerald-500 pulse-green";
+                let statusText = "STABLE";
+                if (marketLocks[market.slug]) {
+                  statusColor = "bg-rose-500 pulse-red";
+                  statusText = "LOCKED";
+                } else if (market.price_yes <= 0.05 || market.price_yes >= 0.95) {
+                  statusColor = "bg-amber-500 pulse-orange";
+                  statusText = "VOLATILE";
+                }
+
+                return (
+                  <div key={market.slug} className="border border-[#1E1E2F] rounded bg-black/40 p-3 flex flex-col gap-2">
+                    <div className="flex items-center justify-between border-b border-[#1E1E2F]/60 pb-1.5">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`w-2 h-2 rounded-full ${statusColor}`} title={`Status: ${statusText}`} />
+                        <span className="text-xs font-bold text-slate-200">{market.symbol} ({market.type})</span>
+                      </div>
+                      <span className={`text-[10px] font-mono font-medium px-1.5 py-0.5 rounded ${
+                        market.time_remaining <= 5 ? 'bg-rose-950/40 text-rose-400 border border-rose-900/40' : 'bg-slate-900 text-slate-400'
+                      }`}>
+                        T-{market.time_remaining}s
+                      </span>
+                    </div>
+                    
+                    <div className="text-[10px] font-mono flex flex-col gap-1 text-slate-400">
+                      <div className="flex justify-between">
+                        <span>Strike:</span>
+                        <span className="text-slate-200">${market.strike_price.toLocaleString(undefined, { minimumFractionDigits: PRICE_DECIMALS[market.symbol] || 2 })}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span>YES / NO:</span>
+                        <span className="text-slate-200">${market.price_yes.toFixed(2)} / ${market.price_no.toFixed(2)}</span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+              {activeMarkets.length === 0 && (
+                <div className="col-span-full text-center py-10 text-slate-500 font-mono text-xs">
+                  No active markets found. Syncing Polymarket Gamma API...
+                </div>
+              )}
+            </div>
+          </section>
+
+          {/* 5. Main Dual Panel: Logs Monitor and Live Activity Feed */}
+          <section className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+            {/* Live Activity Feed */}
+            <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded flex flex-col h-[400px]">
+              <div className="px-4 py-3 border-b border-[#1E1E2F]/60 flex items-center justify-between">
+                <h3 className="text-xs uppercase font-mono tracking-widest text-[#10B981] flex items-center gap-1.5">
+                  <Database size={12} /> Live Activity Feed (timestamps in UTC)
+                </h3>
+                <span className="text-[10px] font-mono text-slate-500">Last 50 Trades</span>
+              </div>
+
+              <div className="flex-grow overflow-y-auto">
+                <table className="w-full border-collapse text-left text-xs font-mono">
+                  <thead className="sticky top-0 bg-[#0D0D0D] border-b border-[#1E1E2F]/80 text-slate-400 text-[10px] uppercase tracking-wider">
+                    <tr>
+                      <th className="px-4 py-2.5 font-medium">Time (UTC)</th>
+                      <th className="px-4 py-2.5 font-medium">Market</th>
+                      <th className="px-4 py-2.5 font-medium">Side</th>
+                      <th className="px-4 py-2.5 font-medium text-right">Price</th>
+                      <th className="px-4 py-2.5 font-medium text-right">Size</th>
+                      <th className="px-4 py-2.5 font-medium text-center">Status</th>
+                      <th className="px-4 py-2.5 font-medium text-right">Hash</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#1E1E2F]/40">
+                    {getAggregatedActivityLog().reverse().map((act) => {
+                      let badgeClass = "bg-amber-950/20 text-amber-400 border border-amber-900/30";
+                      if (act.status === "WIN") badgeClass = "bg-emerald-950/20 text-emerald-400 border border-emerald-900/30";
+                      if (act.status === "LOSS") badgeClass = "bg-rose-950/20 text-rose-400 border border-rose-900/30";
+                      if (act.status === "BLOCKED") badgeClass = "bg-slate-950/20 text-slate-500 border border-slate-900/30";
+                      
+                      const dt = new Date(act.datetime_utc);
+                      const timeStr = dt.toISOString().substr(11, 8);
+                      const mktSymbol = act.slug.split('-')[0].toUpperCase();
+                      const mktInterval = act.slug.includes('-5m-') ? '5M' : '15M';
+                      const isBlocked = act.status === "BLOCKED";
+
+                      return (
+                        <tr key={act.tx_hash} className={`hover:bg-[#121216]/50 transition-colors ${isBlocked ? 'text-slate-500/80 bg-slate-950/20' : ''}`}>
+                          <td className="px-4 py-2.5 text-slate-500">{timeStr}</td>
+                          <td className={`px-4 py-2.5 font-bold ${isBlocked ? 'text-slate-500' : 'text-slate-300'}`}>{mktSymbol}-{mktInterval}</td>
+                          <td className="px-4 py-2.5 text-slate-500">BUY {act.outcome}</td>
+                          <td className={`px-4 py-2.5 text-right font-semibold ${isBlocked ? 'text-slate-500' : 'text-slate-200'}`}>
+                            {isBlocked ? "—" : `$${act.price.toFixed(3)}`}
+                          </td>
+                          <td className={`px-4 py-2.5 text-right ${isBlocked ? 'text-slate-500' : 'text-slate-300'}`}>
+                            {isBlocked ? "—" : act.size.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+                          </td>
+                          <td className="px-4 py-2.5 text-center">
+                            <span className={`text-[10px] px-2 py-0.5 rounded font-bold ${badgeClass}`}>
+                              {act.status}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2.5 text-right">
+                            {isBlocked ? (
+                              <span className="text-slate-600 select-none">—</span>
+                            ) : (
+                              <a 
+                                href={`https://polygonscan.com/tx/${act.tx_hash}`} 
+                                target="_blank" 
+                                rel="noreferrer"
+                                className="text-slate-500 hover:text-[#10B981] flex items-center justify-end gap-1.5"
+                              >
+                                <span>{act.tx_hash.substr(0, 6)}</span>
+                                <ExternalLink size={10} />
+                              </a>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {getAggregatedActivityLog().length === 0 && (
+                      <tr>
+                        <td colSpan="7" className="text-center py-16 text-slate-500">
+                          Waiting for live executions... Dry running Strategy B penny wicks.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* System Console Logs */}
+            <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded flex flex-col h-[400px]">
+              <div className="px-4 py-3 border-b border-[#1E1E2F]/60 flex items-center justify-between">
+                <h3 className="text-xs uppercase font-mono tracking-widest text-[#10B981] flex items-center gap-1.5">
+                  <Terminal size={12} /> System Process Monitor (timestamps in server local time)
+                </h3>
+                
+                <div className="flex items-center gap-2">
+                  <div className="flex rounded border border-[#1E1E2F] p-0.5 bg-black/40 text-[8px] font-mono uppercase tracking-wider text-slate-500">
+                    {["ALL", "TRADES", "BLOCKED", "SYSTEM"].map((f) => (
+                      <button
+                        key={f}
+                        onClick={() => setLogFilter(f)}
+                        className={`px-1.5 py-0.5 rounded transition-colors ${
+                          logFilter === f ? "bg-slate-800 text-slate-200 font-bold" : "hover:text-slate-300"
+                        }`}
+                      >
+                        {f}
+                      </button>
+                    ))}
+                  </div>
+                  <button 
+                    onClick={() => setIsPausedStream(prev => !prev)}
+                    className={`px-2 py-1 rounded border text-[10px] font-mono transition-colors ${
+                      isPausedStream 
+                        ? 'border-amber-900/50 bg-amber-950/20 text-amber-400' 
+                        : 'border-[#1E1E2F] bg-slate-900 text-slate-400 hover:bg-slate-800'
+                    }`}
+                  >
+                    {isPausedStream ? 'Resume' : 'Pause'}
+                  </button>
+                </div>
+              </div>
+
+              <div 
+                ref={consoleContainerRef} 
+                onScroll={handleConsoleScroll}
+                className="flex-grow p-4 overflow-y-auto font-mono text-xs leading-relaxed space-y-1.5 flex flex-col justify-start"
+              >
+                {filteredLogs.map((log, idx) => {
+                  let styleClass = "text-slate-400";
+                  if (log.includes("[MAKER LIMIT POSTED]")) styleClass = "text-amber-400 font-medium";
+                  else if (log.includes("[MAKER LIMIT FILLED]")) styleClass = "text-emerald-400 font-bold";
+                  else if (log.includes("Arbitrage window") || log.includes("Executing BUY")) styleClass = "text-[#10B981] font-bold";
+                  else if (log.includes("WIN") || log.includes("filled") || log.includes("[Limit Filled]")) styleClass = "text-emerald-400 font-semibold";
+                  else if (log.includes("LOSS") || log.includes("blocked") || log.includes("exceeds") || log.includes("[Blocked]") || log.includes("[BLOCKED]")) styleClass = "text-slate-500 font-mono";
+                  else if (log.includes("Round Settled") || log.includes("Market Active") || log.includes("LOCKED")) styleClass = "text-slate-200 font-semibold";
+                  
+                  return (
+                    <div key={idx} className={styleClass}>
+                      {log}
+                    </div>
+                  );
+                })}
+                {filteredLogs.length === 0 && (
+                  <div className="text-slate-500 italic text-center py-16">[ No logs matching current filter ]</div>
+                )}
+              </div>
+            </div>
+          </section>
+        </>
+      ) : (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* Left panel: parameters */}
+          <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-5 space-y-4 h-fit">
+            <h3 className="text-xs uppercase font-mono tracking-widest text-[#10B981] border-b border-[#1E1E2F]/60 pb-2">
+              Backtest Settings
+            </h3>
+            
+            <div className="space-y-3">
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[10px] font-mono text-slate-500 uppercase">Start Date</label>
+                <input 
+                  type="date"
+                  value={backtestParams.startDate}
+                  onChange={(e) => setBacktestParams(prev => ({ ...prev, startDate: e.target.value }))}
+                  disabled={backtesting}
+                  className="bg-[#040407] border border-[#1E1E2F] rounded px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-emerald-500 w-full"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[10px] font-mono text-slate-500 uppercase">End Date</label>
+                <input 
+                  type="date"
+                  value={backtestParams.endDate}
+                  onChange={(e) => setBacktestParams(prev => ({ ...prev, endDate: e.target.value }))}
+                  disabled={backtesting}
+                  className="bg-[#040407] border border-[#1E1E2F] rounded px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-emerald-500 w-full"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <div className="flex justify-between text-[10px] font-mono uppercase">
+                  <span className="text-slate-500">Proximity Fence</span>
+                  <span className="text-slate-300 font-bold">{backtestParams.proximityLimit}%</span>
+                </div>
+                <input 
+                  type="range"
+                  min="0.01"
+                  max="0.10"
+                  step="0.01"
+                  value={backtestParams.proximityLimit}
+                  onChange={(e) => setBacktestParams(prev => ({ ...prev, proximityLimit: parseFloat(e.target.value) }))}
+                  disabled={backtesting}
+                  className="w-full accent-emerald-500 bg-slate-800"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <div className="flex justify-between text-[10px] font-mono uppercase">
+                  <span className="text-slate-500">OBI Cutoff</span>
+                  <span className="text-slate-300 font-bold">±{backtestParams.obiCutoff}</span>
+                </div>
+                <input 
+                  type="range"
+                  min="0.50"
+                  max="0.95"
+                  step="0.05"
+                  value={backtestParams.obiCutoff}
+                  onChange={(e) => setBacktestParams(prev => ({ ...prev, obiCutoff: parseFloat(e.target.value) }))}
+                  disabled={backtesting}
+                  className="w-full accent-emerald-500 bg-slate-800"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[10px] font-mono text-slate-500 uppercase">Mock Position Size ($)</label>
+                <input 
+                  type="number"
+                  step="1"
+                  value={backtestParams.baseSize}
+                  onChange={(e) => setBacktestParams(prev => ({ ...prev, baseSize: parseFloat(e.target.value) || 0 }))}
+                  disabled={backtesting}
+                  className="bg-[#040407] border border-[#1E1E2F] rounded px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-emerald-500 w-full"
+                />
+              </div>
+            </div>
+
+            <button
+              onClick={handleRunBacktest}
+              disabled={backtesting}
+              className={`w-full py-2.5 rounded font-mono text-xs uppercase tracking-wider font-bold transition-all ${
+                backtesting 
+                  ? "bg-emerald-950/20 text-emerald-400 border border-emerald-900/50 cursor-not-allowed animate-pulse" 
+                  : "bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-900/20"
+              }`}
+            >
+              {backtesting ? "Running Simulation..." : "Run Historical Simulation"}
+            </button>
+          </div>
+
+          {/* Right panel: Results */}
+          <div className="lg:col-span-2 space-y-6">
+            {!backtestResults && !backtesting && (
+              <div className="flex flex-col items-center justify-center p-20 border border-[#1E1E2F] border-dashed rounded bg-[#0d0d0d]/40 text-center space-y-3">
+                <div className="text-slate-600 uppercase font-mono text-xs tracking-wider">No Simulation Runs Recorded</div>
+                <p className="text-[10px] text-slate-500 max-w-sm font-mono leading-relaxed">
+                  Adjust date parameters and trigger boundaries on the left, then launch to visualize backtested equity drawdowns.
+                </p>
+              </div>
+            )}
+
+            {backtesting && (
+              <div className="flex flex-col items-center justify-center p-24 border border-[#1E1E2F] rounded bg-[#0d0d0d]/60 text-center space-y-3.5">
+                <div className="w-6 h-6 rounded-full border-2 border-emerald-500 border-t-transparent animate-spin" />
+                <div className="text-emerald-400 font-mono text-[10px] uppercase tracking-widest animate-pulse">
+                  Replaying historical market Klines...
+                </div>
+              </div>
+            )}
+
+            {backtestResults && !backtesting && (
+              <div className="space-y-6">
+                {/* KPI Metrics */}
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                  <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col gap-1">
+                    <span className="text-[9px] text-slate-500 uppercase font-mono tracking-wider">Simulated Rounds</span>
+                    <span className="text-lg font-mono-val font-bold text-slate-200">{backtestResults.total_rounds}</span>
+                  </div>
+                  <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col gap-1">
+                    <span className="text-[9px] text-slate-500 uppercase font-mono tracking-wider">Total Executions</span>
+                    <span className="text-lg font-mono-val font-bold text-slate-200">{backtestResults.total_executions}</span>
+                  </div>
+                  <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col gap-1">
+                    <span className="text-[9px] text-slate-500 uppercase font-mono tracking-wider">Win Rate %</span>
+                    <span className={`text-lg font-mono-val font-bold ${backtestResults.win_rate >= 60 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                      {backtestResults.win_rate}%
+                    </span>
+                  </div>
+                  <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col gap-1">
+                    <span className="text-[9px] text-slate-500 uppercase font-mono tracking-wider">Gross Revenue</span>
+                    <span className="text-lg font-mono-val font-bold text-slate-200">${backtestResults.gross_revenue}</span>
+                  </div>
+                  <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col gap-1">
+                    <span className="text-[9px] text-slate-500 uppercase font-mono tracking-wider">Net Profit</span>
+                    <span className={`text-lg font-mono-val font-bold ${backtestResults.net_profit >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      ${backtestResults.net_profit >= 0 ? '+' : ''}{backtestResults.net_profit} USDC
+                    </span>
+                  </div>
+                  <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col gap-1">
+                    <span className="text-[9px] text-slate-500 uppercase font-mono tracking-wider">Max Drawdown</span>
+                    <span className="text-lg font-mono-val font-bold text-amber-500">
+                      {backtestResults.max_drawdown_pct}%
+                    </span>
+                  </div>
+                </div>
+
+                {/* Equity Timeline SVG Chart */}
+                <SimulationChart data={backtestResults.equity_timeline} />
+              </div>
             )}
           </div>
-        </section>
-      </div>
+        </div>
+      )}
       
       {/* 7. Connection Settings Overlay Modal */}
       {showConnectionConfig && (
