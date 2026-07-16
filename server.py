@@ -395,6 +395,16 @@ class TradingEngine:
                 elif action == "trigger_gas_bump":
                     self.latency_ms = max(0.5, self.latency_ms - 0.3)
                     self.add_system_log("Manual gas priority bump triggered. Network latency optimized.")
+                elif action == "request_csv_data":
+                    csv_content, filename = self.generate_csv_string()
+                    # Also write it locally to the server disk
+                    await asyncio.to_thread(self.export_trades_to_csv, filename)
+                    # Send response back to the requesting client
+                    await websocket.send(json.dumps({
+                        "type": "csv_data",
+                        "filename": filename,
+                        "csv_content": csv_content
+                    }))
         except Exception as e:
             pass
         finally:
@@ -1001,6 +1011,87 @@ class TradingEngine:
             self.add_system_log(f"Export completed: {len(rows)} records flushed to {filename}.")
         except Exception as e:
             self.add_system_log(f"Database CSV export error: {e}")
+
+    def generate_csv_string(self):
+        """Queries database and generates the CSV content as a string."""
+        import io
+        import csv
+        from datetime import datetime, timezone
+        
+        date_str = datetime.now(timezone.utc).strftime("%Y_%m_%d")
+        filename = f"poly_bot_live_dump_{date_str}.csv"
+        
+        try:
+            query = """
+            SELECT id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
+                   execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason
+            FROM trades
+            ORDER BY timestamp_utc ASC;
+            """
+            cursor = self.db.execute(query)
+            if not cursor:
+                return "Error querying database", filename
+            
+            rows = cursor.fetchall()
+            
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow([
+                "timestamp", "datetime_utc", "market_slug", "strategy_type", "execution_mode",
+                "side_outcome", "strike_price", "trigger_spot_price", "time_delta_seconds",
+                "entry_price", "shares_count", "usdc_size", "priority_gas_gwei", "pnl_status",
+                "block_reason", "transaction_hash"
+            ])
+            
+            for r in rows:
+                tx_hash = r[0]
+                dt_utc = r[1]
+                slug = r[2]
+                strategy = r[3]
+                outcome = r[4]
+                price = float(r[5]) if r[5] is not None else 0.0
+                size = float(r[6]) if r[6] is not None else 0.0
+                gas = float(r[7]) if r[7] is not None else 0.0
+                status = r[8]
+                mode = r[10] or "MAKER_LIMIT"
+                strike = float(r[11]) if r[11] is not None else 0.0
+                spot = float(r[12]) if r[12] is not None else 0.0
+                time_delta = float(r[13]) if r[13] is not None else 0.0
+                block_reason = r[14] or ""
+                
+                if isinstance(dt_utc, datetime):
+                    ts_ms = int(dt_utc.timestamp() * 1000)
+                    iso_str = dt_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                else:
+                    try:
+                        clean_dt_str = str(dt_utc).replace("Z", "+00:00").strip()
+                        dt = datetime.fromisoformat(clean_dt_str)
+                        ts_ms = int(dt.timestamp() * 1000)
+                        iso_str = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                    except Exception:
+                        ts_ms = int(time.time() * 1000)
+                        iso_str = str(dt_utc)
+                        
+                strat_upper = str(strategy).upper()
+                if "PENNY" in strat_upper or "B" in strat_upper:
+                    strat_mapped = "STRATEGY_B_PENNY"
+                else:
+                    strat_mapped = "STRATEGY_A_ARB"
+                    
+                out_upper = str(outcome).upper()
+                if "UP" in out_upper or "YES" in out_upper:
+                    side_mapped = "BUY_UP"
+                else:
+                    side_mapped = "BUY_DOWN"
+                    
+                writer.writerow([
+                    ts_ms, iso_str, slug, strat_mapped, mode, side_mapped, strike, spot, time_delta,
+                    price, size, round(price * size, 4), gas, status, block_reason, tx_hash
+                ])
+                
+            return output.getvalue(), filename
+        except Exception as e:
+            return f"Error exporting CSV: {e}", filename
 
 async def main():
     engine = TradingEngine()

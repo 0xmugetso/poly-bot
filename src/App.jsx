@@ -10,7 +10,8 @@ import {
   Cpu, 
   ExternalLink,
   ShieldCheck,
-  Flame
+  Flame,
+  Download
 } from 'lucide-react';
 
 const PRICE_DECIMALS = { BTC: 1, ETH: 2, SOL: 2, XRP: 4, BNB: 2 };
@@ -119,6 +120,20 @@ export default function App() {
       const data = jsonParse(event.data);
       if (!data) return;
 
+      if (data.type === "csv_data") {
+        const blob = new Blob([data.csv_content], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.setAttribute("href", url);
+        link.setAttribute("download", data.filename);
+        link.style.visibility = 'hidden';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        addLocalSystemLog(`[EXPORT] Database snapshot downloaded: ${data.filename}`);
+        return;
+      }
+
       // Update basic fields
       setWallet(data.wallet);
       setNetPnlUsdc(data.net_pnl_usdc);
@@ -192,6 +207,16 @@ export default function App() {
   const handleTriggerGas = () => {
     if (ws.current && ws.current.readyState === WebSocket.OPEN) {
       ws.current.send(JSON.stringify({ action: "trigger_gas_bump" }));
+    }
+  };
+
+  // Trigger manual CSV export of all database trades
+  const handleExportCsv = () => {
+    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+      ws.current.send(JSON.stringify({ action: "request_csv_data" }));
+      addLocalSystemLog("Requesting database CSV snapshot from server...");
+    } else {
+      addLocalSystemLog("Database CSV export failed: Connection is offline.");
     }
   };
 
@@ -300,6 +325,15 @@ export default function App() {
             >
               <Flame size={13} />
               <span>Optimized Gas</span>
+            </button>
+
+            <button 
+              onClick={handleExportCsv}
+              className="px-3 py-1.5 rounded border border-sky-900/50 bg-sky-950/20 text-sky-400 hover:bg-sky-950/40 text-xs font-medium transition-colors flex items-center gap-1.5"
+              title="Export CSV Log"
+            >
+              <Download size={13} />
+              <span>Export CSV</span>
             </button>
           </div>
         </div>
