@@ -84,7 +84,9 @@ class DatabaseManager:
             strike_price DECIMAL(12, 4),
             trigger_spot_price DECIMAL(12, 4),
             time_delta_seconds DECIMAL(10, 4),
-            block_reason VARCHAR(128)
+            block_reason VARCHAR(128),
+            rejection_reason VARCHAR(64) DEFAULT NULL,
+            spot_strike_delta DECIMAL(16, 6) DEFAULT NULL
         );
         """
         
@@ -110,7 +112,9 @@ class DatabaseManager:
                                       ("strike_price", "DECIMAL(12, 4)"),
                                       ("trigger_spot_price", "DECIMAL(12, 4)"),
                                       ("time_delta_seconds", "DECIMAL(10, 4)"),
-                                      ("block_reason", "VARCHAR(128)")]:
+                                      ("block_reason", "VARCHAR(128)"),
+                                      ("rejection_reason", "VARCHAR(64) DEFAULT NULL"),
+                                      ("spot_strike_delta", "DECIMAL(16, 6) DEFAULT NULL")]:
                     try:
                         cursor.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type};")
                         self.conn.commit()
@@ -143,16 +147,17 @@ class DatabaseManager:
 
     def insert_trade(self, id_, timestamp, slug, strategy, outcome, price, size, gas, status,
                      execution_mode="MAKER_LIMIT", strike_price=None, trigger_spot_price=None,
-                     time_delta_seconds=None, block_reason=None):
+                     time_delta_seconds=None, block_reason=None, rejection_reason=None, spot_strike_delta=None):
         query = """
         INSERT INTO trades (id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
-                            execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                            execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
         """
         if self.is_postgres:
             query = query.replace("?", "%s")
         self.execute(query, (id_, timestamp, slug, strategy, outcome, price, size, gas, status,
-                             execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason))
+                             execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason,
+                             rejection_reason, spot_strike_delta))
         
     def resolve_trade(self, id_, status, resolved_at):
         query = """
@@ -399,7 +404,7 @@ class TradingEngine:
                 elif action == "trigger_gas_bump":
                     self.latency_ms = max(0.5, self.latency_ms - 0.3)
                     self.add_system_log("Manual gas priority bump triggered. Network latency optimized.")
-                elif action == "request_csv_data":
+                elif action in ["request_csv_data", "export_telemetry"]:
                     csv_content, filename = self.generate_csv_string()
                     # Also write it locally to the server disk
                     await asyncio.to_thread(self.export_trades_to_csv, filename)
@@ -533,7 +538,8 @@ class TradingEngine:
                             "clobTokenIds": json.loads(details.get("clobTokenIds", "[]")),
                             "conditionId": details.get("conditionId"),
                             "last_evaluated": 0,
-                            "resolved": False
+                            "resolved": False,
+                            "blocked_logged": False
                         }
                         self.add_system_log(f"Market Active: {slug_5m} | Strike Price Set: ${strike:,.2f}")
                     else:
@@ -551,7 +557,8 @@ class TradingEngine:
                             "clobTokenIds": [f"yes-{t_rounded_5m}", f"no-{t_rounded_5m}"],
                             "conditionId": f"cond-{t_rounded_5m}",
                             "last_evaluated": 0,
-                            "resolved": False
+                            "resolved": False,
+                            "blocked_logged": False
                         }
 
             # 2. Evaluate execution triggers (-5s to +2s window)
@@ -590,7 +597,36 @@ class TradingEngine:
                     proximity = abs(spot - strike) / strike
                     is_valid = (proximity <= 0.0002)
                     market["proximity_enabled"] = is_valid
-                    self.add_system_log(f"[{'ENABLED' if is_valid else 'BLOCKED'}] Proximity check for {slug}: Proximity = {proximity:.6f} (Limit: 0.0002)")
+                    spot_strike_delta = abs(spot - strike)
+                    
+                    if not is_valid:
+                        self.add_system_log(f"[Blocked] Proximity check for {slug}: Proximity = {proximity:.6f} (Limit: 0.0002)")
+                        if not market.get("blocked_logged", False):
+                            tx_hash = f"0x{random.randbytes(32).hex()}"
+                            self.db.insert_trade(
+                                tx_hash,
+                                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                                slug,
+                                "Strategy B (Penny Sweep)",
+                                "Up",
+                                0.0,
+                                0.0,
+                                self.priority_gas_gwei,
+                                "BLOCKED",
+                                execution_mode="MAKER_LIMIT",
+                                strike_price=strike,
+                                trigger_spot_price=spot,
+                                time_delta_seconds=time_remaining,
+                                block_reason="PRICE_PROXIMITY_FAIL",
+                                rejection_reason="PRICE_PROXIMITY_FAIL",
+                                spot_strike_delta=spot_strike_delta
+                            )
+                            # Create a fake activity log item for streaming to UI
+                            self.add_activity(slug, "Up/Down", 0.0, 0.0, "BLOCKED", tx_hash)
+                            self.add_system_log(f"[BLOCKED] {symbol}-5M BLOCKED: Proximity Delta (${spot_strike_delta:.3f}) exceeded 0.02% limit")
+                            market["blocked_logged"] = True
+                    else:
+                        self.add_system_log(f"[ENABLED] Proximity check for {slug}: Proximity = {proximity:.6f} (Limit: 0.0002)")
                 
                 # Dynamic contract pricing estimation based on spot vs strike
                 # Difference between spot and strike
@@ -681,22 +717,55 @@ class TradingEngine:
                         # We evaluate YES/NO only for Strategy B (Penny Sweeps) targeting $0.01 to $0.04
                         
                         # Check YES (Up)
-                        if 0.01 <= price_yes <= 0.04:
-                            if market.get("proximity_enabled", True):
-                                obi = self.live_obi.get(market["symbol"], 0.0)
+                        yes_in_range = (0.01 <= price_yes <= 0.04)
+                        no_in_range = (0.01 <= price_no <= 0.04)
+                        
+                        yes_triggered = False
+                        no_triggered = False
+                        
+                        if market.get("proximity_enabled", True):
+                            obi = self.live_obi.get(market["symbol"], 0.0)
+                            
+                            if yes_in_range:
                                 if obi > 0.65:
                                     self.post_maker_limit_order(market, "Up", price_yes, "Strategy B (Penny Sweep)")
+                                    yes_triggered = True
                                 else:
                                     self.add_system_log(f"[Blocked] Up trigger skipped on {slug}: OBI ({obi:.3f}) <= 0.65")
-                            
-                        # Check NO (Down)
-                        if 0.01 <= price_no <= 0.04:
-                            if market.get("proximity_enabled", True):
-                                obi = self.live_obi.get(market["symbol"], 0.0)
+                                    
+                            if no_in_range:
                                 if obi < -0.65:
                                     self.post_maker_limit_order(market, "Down", price_no, "Strategy B (Penny Sweep)")
+                                    no_triggered = True
                                 else:
                                     self.add_system_log(f"[Blocked] Down trigger skipped on {slug}: OBI ({obi:.3f}) >= -0.65")
+                                    
+                            # Log block once per round if in range but OBI did not match
+                            if (yes_in_range and not yes_triggered) or (no_in_range and not no_triggered):
+                                if not market.get("blocked_logged", False):
+                                    spot_strike_delta = abs(spot - strike)
+                                    tx_hash = f"0x{random.randbytes(32).hex()}"
+                                    self.db.insert_trade(
+                                        tx_hash,
+                                        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                                        slug,
+                                        "Strategy B (Penny Sweep)",
+                                        "Up" if yes_in_range else "Down",
+                                        price_yes if yes_in_range else price_no,
+                                        0.0,
+                                        self.priority_gas_gwei,
+                                        "BLOCKED",
+                                        execution_mode="MAKER_LIMIT",
+                                        strike_price=strike,
+                                        trigger_spot_price=spot,
+                                        time_delta_seconds=time_remaining,
+                                        block_reason="MOMENTUM_IMBALANCE_FAIL",
+                                        rejection_reason="MOMENTUM_IMBALANCE_FAIL",
+                                        spot_strike_delta=spot_strike_delta
+                                    )
+                                    self.add_activity(slug, "Up" if yes_in_range else "Down", 0.0, 0.0, "BLOCKED", tx_hash)
+                                    self.add_system_log(f"[BLOCKED] {symbol}-5M BLOCKED: OBI ({obi:.3f}) momentum insufficient")
+                                    market["blocked_logged"] = True
 
                 # 3. Post-Close Settlement Resolution (+2s grace period exploit)
                 # Polymarket oracle settlement delay allows scanning/executing for up to 2s post-close
@@ -949,7 +1018,7 @@ class TradingEngine:
         try:
             query = """
             SELECT id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
-                   execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason
+                   execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta
             FROM trades
             ORDER BY timestamp_utc ASC;
             """
@@ -978,6 +1047,8 @@ class TradingEngine:
                     "priority_gas_gwei",
                     "pnl_status",
                     "block_reason",
+                    "rejection_reason",
+                    "spot_strike_delta",
                     "transaction_hash"
                 ])
                 
@@ -996,6 +1067,8 @@ class TradingEngine:
                     spot = float(r[12]) if r[12] is not None else 0.0
                     time_delta = float(r[13]) if r[13] is not None else 0.0
                     block_reason = r[14] or ""
+                    rejection = r[15] or ""
+                    delta_spot_strike = float(r[16]) if r[16] is not None else 0.0
                     
                     if isinstance(dt_utc, datetime):
                         ts_ms = int(dt_utc.timestamp() * 1000)
@@ -1038,6 +1111,8 @@ class TradingEngine:
                         gas,
                         status,
                         block_reason,
+                        rejection,
+                        delta_spot_strike,
                         tx_hash
                     ])
                     
@@ -1057,7 +1132,7 @@ class TradingEngine:
         try:
             query = """
             SELECT id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
-                   execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason
+                   execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta
             FROM trades
             ORDER BY timestamp_utc ASC;
             """
@@ -1073,7 +1148,7 @@ class TradingEngine:
                 "timestamp", "datetime_utc", "market_slug", "strategy_type", "execution_mode",
                 "side_outcome", "strike_price", "trigger_spot_price", "time_delta_seconds",
                 "entry_price", "shares_count", "usdc_size", "priority_gas_gwei", "pnl_status",
-                "block_reason", "transaction_hash"
+                "block_reason", "rejection_reason", "spot_strike_delta", "transaction_hash"
             ])
             
             for r in rows:
@@ -1091,6 +1166,8 @@ class TradingEngine:
                 spot = float(r[12]) if r[12] is not None else 0.0
                 time_delta = float(r[13]) if r[13] is not None else 0.0
                 block_reason = r[14] or ""
+                rejection = r[15] or ""
+                delta_spot_strike = float(r[16]) if r[16] is not None else 0.0
                 
                 if isinstance(dt_utc, datetime):
                     ts_ms = int(dt_utc.timestamp() * 1000)
@@ -1119,7 +1196,7 @@ class TradingEngine:
                     
                 writer.writerow([
                     ts_ms, iso_str, slug, strat_mapped, mode, side_mapped, strike, spot, time_delta,
-                    price, size, round(price * size, 4), gas, status, block_reason, tx_hash
+                    price, size, round(price * size, 4), gas, status, block_reason, rejection, delta_spot_strike, tx_hash
                 ])
                 
             return output.getvalue(), filename

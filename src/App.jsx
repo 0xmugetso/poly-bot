@@ -164,12 +164,14 @@ export default function App() {
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.setAttribute("href", url);
-        link.setAttribute("download", data.filename);
+        const timestamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "_").replace("T", "_");
+        const filename = `poly_bot_manual_dump_${timestamp}.csv`;
+        link.setAttribute("download", filename);
         link.style.visibility = 'hidden';
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
-        addLocalSystemLog(`[EXPORT] Database snapshot downloaded: ${data.filename}`);
+        addLocalSystemLog(`[EXPORT] Database snapshot downloaded: ${filename}`);
         return;
       }
 
@@ -273,7 +275,7 @@ export default function App() {
   // Trigger manual CSV export of all database trades
   const handleExportCsv = () => {
     if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-      ws.current.send(JSON.stringify({ action: "request_csv_data" }));
+      ws.current.send(JSON.stringify({ action: "export_telemetry" }));
       addLocalSystemLog("Requesting database CSV snapshot from server...");
     } else {
       addLocalSystemLog("Database CSV export failed: Connection is offline.");
@@ -410,10 +412,10 @@ export default function App() {
             <button 
               onClick={handleExportCsv}
               className="px-3 py-1.5 rounded border border-sky-900/50 bg-sky-950/20 text-sky-400 hover:bg-sky-950/40 text-xs font-medium transition-colors flex items-center gap-1.5"
-              title="Export CSV Log"
+              title="Export Telemetry Logs"
             >
               <Download size={13} />
-              <span>Export CSV</span>
+              <span>Export Logs</span>
             </button>
           </div>
         </div>
@@ -638,34 +640,44 @@ export default function App() {
                   let badgeClass = "bg-amber-950/20 text-amber-400 border border-amber-900/30";
                   if (act.status === "WIN") badgeClass = "bg-emerald-950/20 text-emerald-400 border border-emerald-900/30";
                   if (act.status === "LOSS") badgeClass = "bg-rose-950/20 text-rose-400 border border-rose-900/30";
+                  if (act.status === "BLOCKED") badgeClass = "bg-slate-950/20 text-slate-500 border border-slate-900/30";
                   
                   const dt = new Date(act.datetime_utc);
                   const timeStr = dt.toISOString().substr(11, 8);
                   const mktSymbol = act.slug.split('-')[0].toUpperCase();
                   const mktInterval = act.slug.includes('-5m-') ? '5M' : '15M';
+                  const isBlocked = act.status === "BLOCKED";
 
                   return (
-                    <tr key={act.tx_hash} className="hover:bg-[#121216]/50 transition-colors">
+                    <tr key={act.tx_hash} className={`hover:bg-[#121216]/50 transition-colors ${isBlocked ? 'text-slate-500/80 bg-slate-950/20' : ''}`}>
                       <td className="px-4 py-2.5 text-slate-500">{timeStr}</td>
-                      <td className="px-4 py-2.5 text-slate-300 font-bold">{mktSymbol}-{mktInterval}</td>
-                      <td className="px-4 py-2.5 text-slate-400">BUY {act.outcome}</td>
-                      <td className="px-4 py-2.5 text-right font-semibold text-slate-200">${act.price.toFixed(3)}</td>
-                      <td className="px-4 py-2.5 text-right text-slate-300">{act.size.toLocaleString(undefined, { maximumFractionDigits: 1 })}</td>
+                      <td className={`px-4 py-2.5 font-bold ${isBlocked ? 'text-slate-500' : 'text-slate-300'}`}>{mktSymbol}-{mktInterval}</td>
+                      <td className="px-4 py-2.5 text-slate-500">BUY {act.outcome}</td>
+                      <td className={`px-4 py-2.5 text-right font-semibold ${isBlocked ? 'text-slate-500' : 'text-slate-200'}`}>
+                        {isBlocked ? "—" : `$${act.price.toFixed(3)}`}
+                      </td>
+                      <td className={`px-4 py-2.5 text-right ${isBlocked ? 'text-slate-500' : 'text-slate-300'}`}>
+                        {isBlocked ? "—" : act.size.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+                      </td>
                       <td className="px-4 py-2.5 text-center">
                         <span className={`text-[10px] px-2 py-0.5 rounded font-bold ${badgeClass}`}>
                           {act.status}
                         </span>
                       </td>
                       <td className="px-4 py-2.5 text-right">
-                        <a 
-                          href={`https://polygonscan.com/tx/${act.tx_hash}`} 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="text-slate-500 hover:text-[#10B981] flex items-center justify-end gap-1.5"
-                        >
-                          <span>{act.tx_hash.substr(0, 6)}</span>
-                          <ExternalLink size={10} />
-                        </a>
+                        {isBlocked ? (
+                          <span className="text-slate-600 select-none">—</span>
+                        ) : (
+                          <a 
+                            href={`https://polygonscan.com/tx/${act.tx_hash}`} 
+                            target="_blank" 
+                            rel="noreferrer"
+                            className="text-slate-500 hover:text-[#10B981] flex items-center justify-end gap-1.5"
+                          >
+                            <span>{act.tx_hash.substr(0, 6)}</span>
+                            <ExternalLink size={10} />
+                          </a>
+                        )}
                       </td>
                     </tr>
                   );
