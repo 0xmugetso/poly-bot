@@ -1,6 +1,7 @@
 import time
 import json
 import random
+import os
 import urllib.request
 import ssl
 from datetime import datetime, timezone, timedelta
@@ -15,30 +16,36 @@ class Backtester:
         self.symbols = ["BTC", "ETH", "SOL", "XRP", "BNB"]
 
     def fetch_binance_klines(self, symbol, start_ms, end_ms, limit=1000):
-        """Fetches historical 1-minute candles from Binance REST API for a specific period."""
-        try:
-            pair = f"{symbol}USDT"
-            url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval=1m&startTime={start_ms}&endTime={end_ms}&limit={limit}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            ctx = ssl._create_unverified_context()
-            res = urllib.request.urlopen(req, timeout=3, context=ctx).read()
-            data = json.loads(res)
-            # Row format: [OpenTime, Open, High, Low, Close, Volume, CloseTime, ...]
-            candles = []
-            for row in data:
-                candles.append({
-                    "open": float(row[1]),
-                    "high": float(row[2]),
-                    "low": float(row[3]),
-                    "close": float(row[4]),
-                    "time": int(row[0]) // 1000
-                })
-            return candles
-        except Exception:
-            return None
+        """Fetches historical 5-minute candles from Binance REST API for a specific period.
+        Bypasses geoblocks dynamically by falling back to binance.us.
+        """
+        pair = f"{symbol}USDT"
+        hosts = ["https://api.binance.com", "https://api.binance.us"]
+        ctx = ssl._create_unverified_context()
+        
+        for host in hosts:
+            url = f"{host}/api/v3/klines?symbol={pair}&interval=5m&startTime={start_ms}&endTime={end_ms}&limit={limit}"
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                res = urllib.request.urlopen(req, timeout=3, context=ctx).read()
+                data = json.loads(res)
+                if data and isinstance(data, list):
+                    candles = []
+                    for row in data:
+                        candles.append({
+                            "open": float(row[1]),
+                            "high": float(row[2]),
+                            "low": float(row[3]),
+                            "close": float(row[4]),
+                            "time": int(row[0]) // 1000
+                        })
+                    return candles
+            except Exception:
+                continue
+        return None
 
     def generate_monte_carlo_candles(self, symbol, start_price, start_ms, limit=1000):
-        """Generates high-fidelity synthetic candles starting from start_ms."""
+        """Generates high-fidelity synthetic 5-minute candles starting from start_ms."""
         candles = []
         current_price = start_price
         vols = {"BTC": 0.0005, "ETH": 0.0007, "SOL": 0.0012, "XRP": 0.0015, "BNB": 0.0008}
@@ -48,7 +55,7 @@ class Backtester:
         for i in range(limit):
             op = current_price
             prices = [op]
-            for _ in range(4): # interpolate 4 ticks per minute
+            for _ in range(4): # interpolate 4 sub-ticks
                 current_price *= (1 + random.normalvariate(0, vol))
                 prices.append(current_price)
             cl = current_price
@@ -57,7 +64,7 @@ class Backtester:
                 "high": max(prices),
                 "low": min(prices),
                 "close": cl,
-                "time": t_start + (i * 60)
+                "time": t_start + (i * 5 * 60)
             })
         return candles
 
@@ -103,42 +110,85 @@ class Backtester:
             f"[SYSTEM] Proximity limit: {self.proximity_limit*100:.3f}% | OBI cutoff: {self.obi_cutoff:.2f} | Base size: ${self.base_size:.1f}"
         ]
         
-        # We simulate over 5-minute boundaries
+        # Check if local JSON database cache exists
+        local_path = "historical_candles_2026.json"
+        if not os.path.exists(local_path):
+            local_path = "/Users/khash/Projects/poly-bot/historical_candles_2026.json"
+            
+        loaded = False
         symbol_candles = {}
-        for sym in self.symbols:
-            candles = self.fetch_binance_klines(sym, start_ms, end_ms, limit=1000)
-            if not candles:
-                # Fallback to Monte Carlo simulation
+        
+        # 1. Try querying real CEX API directly first
+        logs.append("[SYSTEM] Fetching real historical candles from Binance API...")
+        try:
+            for sym in self.symbols:
+                candles = self.fetch_binance_klines(sym, start_ms, end_ms, limit=1000)
+                if not candles or len(candles) < 5:
+                    raise Exception(f"Failed to fetch live API candles for {sym}")
+                symbol_candles[sym] = candles
+                logs.append(f"[DATA] Fetched {len(candles)} real candles for {sym} from Binance API.")
+            loaded = True
+            logs.append("[SYSTEM] Successfully synced real historical candles from CEX API.")
+        except Exception as e:
+            logs.append(f"[SYSTEM] Live CEX API fetch failed: {e}. Reloading from local database cache...")
+            
+        # 2. If live fetch failed, reload from local JSON database cache file
+        if not loaded:
+            if os.path.exists(local_path):
+                try:
+                    logs.append(f"[SYSTEM] Loading from local database cache: {os.path.basename(local_path)}")
+                    with open(local_path, "r") as f:
+                        db = json.load(f)
+                    
+                    t_start = start_ms // 1000
+                    t_end = end_ms // 1000
+                    
+                    for sym in self.symbols:
+                        all_c = db.get(sym, [])
+                        filtered = [c for c in all_c if t_start <= c["time"] <= t_end]
+                        if len(filtered) < 5:
+                            raise Exception(f"Insufficient cached candles in range for {sym}")
+                        symbol_candles[sym] = filtered
+                        logs.append(f"[DATA] Loaded {len(filtered)} intervals for {sym} from local database cache.")
+                    loaded = True
+                    logs.append("[SYSTEM] Successfully loaded candles from local database cache.")
+                except Exception as cache_err:
+                    logs.append(f"[SYSTEM] Cache load failed: {cache_err}. Falling back to Monte Carlo...")
+                    
+        # 3. If both failed, generate synthetic Monte Carlo data
+        if not loaded:
+            logs.append("[SYSTEM] Initiating offline fallback generator...")
+            for sym in self.symbols:
                 start_prices = {"BTC": 67000.0, "ETH": 3450.0, "SOL": 140.0, "XRP": 0.58, "BNB": 580.0}
                 candles = self.generate_monte_carlo_candles(sym, start_prices.get(sym, 10.0), start_ms, limit=1000)
-                logs.append(f"[DATA] Offline/Geoblocked. Generated 1000 Monte Carlo candles for {sym}.")
-            else:
-                logs.append(f"[DATA] Fetched {len(candles)} historical candles for {sym} from Binance API.")
-            symbol_candles[sym] = candles
+                symbol_candles[sym] = candles
+                logs.append(f"[DATA] Offline fallback. Generated 1000 Monte Carlo candles for {sym}.")
         
         # Check data length
         data_len = min(len(symbol_candles[sym]) for sym in self.symbols)
-        if data_len < 5:
+        if data_len < 2:
             return {
-                "error": "Insufficient historical data fetched.",
+                "error": "Insufficient historical data found or generated.",
                 "total_rounds": 0, "total_executions": 0, "win_rate": 0, "net_profit": 0,
                 "logs": logs
             }
 
-        # Step through 5-candle groups (each representing a 5-minute round)
+        # Step through intervals (each candle represents a 5-minute round)
         equity_timeline = [{"time": 0, "equity": equity}]
         
-        for idx in range(0, data_len - 5, 5):
+        for idx in range(data_len):
             total_rounds += 1
             round_pnl = 0.0
             
             for sym in self.symbols:
-                candles = symbol_candles[sym][idx : idx + 5]
-                # Open of first candle is the strike price
-                strike = candles[0]["open"]
-                # Close of 5th candle is spot price at close
-                spot_at_5s = candles[4]["close"]
-                spot_at_close = candles[4]["close"]
+                c = symbol_candles[sym][idx]
+                strike = c["open"]
+                spot_at_close = c["close"]
+                
+                # Model the spot price 5 seconds before close (adding small tick volatility)
+                vols = {"BTC": 0.0002, "ETH": 0.0003, "SOL": 0.0005, "XRP": 0.0008, "BNB": 0.0003}
+                vol = vols.get(sym, 0.0003)
+                spot_at_5s = spot_at_close * (1 + random.normalvariate(0, vol * 0.1))
                 
                 # Proximity calculation
                 proximity = abs(spot_at_5s - strike) / strike
@@ -154,12 +204,10 @@ class Backtester:
                     price_yes = max(0.01, min(0.99, price_yes))
                     price_no = 1 - price_yes
                     
-                    # Generate deterministic historical OBI (based on candle momentum)
-                    candle_returns = [c["close"] - c["open"] for c in candles]
-                    avg_return = sum(candle_returns) / len(candle_returns)
-                    base_obi = max(-0.95, min(0.95, avg_return / (strike * 0.001)))
-                    # Add random noise to OBI
-                    obi = base_obi + random.uniform(-0.15, 0.15)
+                    # Calculate deterministic OBI based on open-to-close momentum
+                    base_obi = ((spot_at_close - strike) / strike) * 1000.0
+                    base_obi = max(-0.95, min(0.95, base_obi))
+                    obi = base_obi + random.uniform(-0.1, 0.1)
                     
                     yes_in_range = (0.01 <= price_yes <= 0.04)
                     no_in_range = (0.01 <= price_no <= 0.04)
