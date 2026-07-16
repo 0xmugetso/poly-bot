@@ -262,7 +262,8 @@ class TradingEngine:
         self.live_obi = {"BTC": 0.0, "ETH": 0.0, "SOL": 0.0, "XRP": 0.0, "BNB": 0.0}
         self.price_decimals = {"BTC": 1, "ETH": 2, "SOL": 2, "XRP": 4, "BNB": 2}
         self.active_markets = {}  # symbol -> market_details
-        self.rolling_prices = {sym: [] for sym in ["BTC", "ETH", "SOL", "XRP", "BNB"]}
+        self.symbols = ["BTC", "ETH", "SOL", "XRP", "BNB"]
+        self.rolling_prices = {sym: [] for sym in self.symbols}
         self.volatility_coefficient = 0.15
         
         # Activity and logs
