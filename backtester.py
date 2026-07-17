@@ -176,6 +176,9 @@ class Backtester:
         # Step through intervals (each candle represents a 5-minute round)
         equity_timeline = [{"time": 0, "equity": equity}]
         
+        import math
+        rolling_closes = {sym: [] for sym in self.symbols}
+        
         for idx in range(data_len):
             total_rounds += 1
             round_pnl = 0.0
@@ -184,6 +187,11 @@ class Backtester:
                 c = symbol_candles[sym][idx]
                 strike = c["open"]
                 spot_at_close = c["close"]
+                
+                # Append close to rolling closes
+                rolling_closes[sym].append(spot_at_close)
+                if len(rolling_closes[sym]) > 6: # 30 minutes window (6 * 5m candles)
+                    rolling_closes[sym].pop(0)
                 
                 # Model the spot price 5 seconds before close (adding small tick volatility)
                 vols = {"BTC": 0.0002, "ETH": 0.0003, "SOL": 0.0005, "XRP": 0.0008, "BNB": 0.0003}
@@ -198,14 +206,38 @@ class Backtester:
                         logs.append(f"[ERROR] Data mapping corruption detected for {sym} Rd {total_rounds}. Forcing cache flush.")
                     continue
                 
-                # Proximity calculation
-                proximity = abs(spot_at_5s - strike) / strike
                 spot_strike_delta = abs(spot_at_5s - strike)
                 
-                # In backtest mode, allow slightly relaxed constraints to establish trade count baselines
-                proximity_threshold = 0.0005 if self.proximity_limit == 0.0002 else self.proximity_limit
+                # Calculate rolling standard deviation of 5m closes
+                prices = rolling_closes[sym]
+                if len(prices) >= 2:
+                    mean = sum(prices) / len(prices)
+                    var = sum((x - mean) ** 2 for x in prices) / (len(prices) - 1)
+                    std = math.sqrt(var)
+                else:
+                    std = spot_at_5s * 0.0005 # default fallback
+                    
+                calculated_dynamic_limit = std * self.proximity_limit
                 
-                if proximity <= proximity_threshold:
+                # Define hard absolute minimum allowed distance floors per token type
+                FLOOR_LIMITS = {
+                    'BTC': 5.00,
+                    'ETH': 0.50,
+                    'SOL': 0.05,
+                    'XRP': 0.002,
+                    'BNB': 0.20
+                }
+                
+                asset_ticker = sym.upper()
+                final_allowed_limit = max(calculated_dynamic_limit, FLOOR_LIMITS.get(asset_ticker, 0.01))
+                
+                # Fallback to legacy static proximity limit
+                if final_allowed_limit == 0.0:
+                    final_allowed_limit = spot_at_5s * 0.0002
+                    
+                is_valid = (spot_strike_delta <= final_allowed_limit)
+                
+                if is_valid:
                     # Model YES/NO prices
                     delta = spot_at_5s - strike
                     volatility_factor = 2.0 if sym in ["BTC", "BNB"] else 0.1

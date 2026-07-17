@@ -753,17 +753,32 @@ class TradingEngine:
                 if time_remaining <= 5 and "proximity_enabled" not in market:
                     prices = self.rolling_prices.get(symbol, [])
                     std = self.calculate_std(prices)
-                    if std <= 0.0:
-                        std = spot * 0.0005  # fallback to 0.05% of spot
+                    
+                    calculated_dynamic_limit = std * self.volatility_coefficient
+                    
+                    # Define hard absolute minimum allowed distance floors per token type
+                    FLOOR_LIMITS = {
+                        'BTC': 5.00,
+                        'ETH': 0.50,
+                        'SOL': 0.05,
+                        'XRP': 0.002,
+                        'BNB': 0.20
+                    }
+                    
+                    asset_ticker = symbol.upper()
+                    final_allowed_limit = max(calculated_dynamic_limit, FLOOR_LIMITS.get(asset_ticker, 0.01))
+                    
+                    # Operational Live Check: fallback to legacy static proximity limit
+                    if final_allowed_limit == 0.0:
+                        final_allowed_limit = spot * 0.0002
                         
-                    dynamic_allowed_delta = std * self.volatility_coefficient
                     spot_strike_delta = abs(spot - strike)
                     
-                    is_valid = (spot_strike_delta <= dynamic_allowed_delta)
+                    is_valid = (spot_strike_delta <= final_allowed_limit)
                     market["proximity_enabled"] = is_valid
                     
                     if not is_valid:
-                        self.add_system_log(f"[Blocked] Proximity check for {slug}: Price Delta = ${spot_strike_delta:.3f} (Limit: ${dynamic_allowed_delta:.3f}, Std: {std:.3f})")
+                        self.add_system_log(f"[Blocked] Proximity check for {slug}: Price Delta = ${spot_strike_delta:.3f} (Limit: ${final_allowed_limit:.3f}, Std: {std:.3f})")
                         if not market.get("blocked_logged", False):
                             tx_hash = f"0x{random.randbytes(32).hex()}"
                             self.db.insert_trade(
@@ -785,10 +800,10 @@ class TradingEngine:
                                 spot_strike_delta=spot_strike_delta
                             )
                             self.add_activity(slug, "Up/Down", 0.0, 0.0, "BLOCKED", tx_hash)
-                            self.add_system_log(f"[BLOCKED] {symbol}-5M BLOCKED: Price Delta (${spot_strike_delta:.3f}) exceeded dynamic limit (${dynamic_allowed_delta:.3f})")
+                            self.add_system_log(f"[BLOCKED] {symbol}-5M BLOCKED: Price Delta (${spot_strike_delta:.3f}) exceeded dynamic limit (${final_allowed_limit:.3f})")
                             market["blocked_logged"] = True
                     else:
-                        self.add_system_log(f"[ENABLED] Proximity check for {slug}: Price Delta = ${spot_strike_delta:.3f} (Limit: ${dynamic_allowed_delta:.3f}, Std: {std:.3f})")
+                        self.add_system_log(f"[ENABLED] Proximity check for {slug}: Price Delta = ${spot_strike_delta:.3f} (Limit: ${final_allowed_limit:.3f}, Std: {std:.3f})")
                 
                 # Dynamic contract pricing estimation based on spot vs strike
                 # Difference between spot and strike
