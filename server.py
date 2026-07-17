@@ -600,8 +600,36 @@ class TradingEngine:
                 # Fetch details if not already loaded
                 if slug_5m not in self.active_markets:
                     self.add_system_log(f"Syncing active contract details for: {slug_5m}")
-                    details = await asyncio.to_thread(self.fetch_market_details, slug_5m)
                     
+                    # Fetch real spot price first (bypass startup stale default race condition)
+                    stale_defaults = {"BTC": 67250.0, "ETH": 3480.0, "SOL": 142.50, "XRP": 0.58, "BNB": 585.0}
+                    current_spot = self.spot_prices[symbol]
+                    if current_spot == stale_defaults.get(symbol):
+                        try:
+                            pair = f"{symbol}USDT"
+                            url = f"https://api.binance.us/api/v3/ticker/price?symbol={pair}"
+                            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                            ctx = ssl._create_unverified_context()
+                            res = urllib.request.urlopen(req, timeout=2, context=ctx).read()
+                            price_data = json.loads(res)
+                            current_spot = float(price_data["price"])
+                            self.live_prices[symbol] = current_spot
+                            self.add_system_log(f"[SYSTEM] Stale default spot price detected. Restored real {symbol} price: ${current_spot:.2f}")
+                        except Exception:
+                            try:
+                                pair = f"{symbol}USDT"
+                                url = f"https://api.binance.com/api/v3/ticker/price?symbol={pair}"
+                                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                                ctx = ssl._create_unverified_context()
+                                res = urllib.request.urlopen(req, timeout=2, context=ctx).read()
+                                price_data = json.loads(res)
+                                current_spot = float(price_data["price"])
+                                self.live_prices[symbol] = current_spot
+                                self.add_system_log(f"[SYSTEM] Stale default spot price detected. Restored real {symbol} price: ${current_spot:.2f}")
+                            except Exception:
+                                pass
+                                
+                    details = await asyncio.to_thread(self.fetch_market_details, slug_5m)
                     if not details:
                         # Fallback logic loop: refresh from Gamma /markets wrapper
                         self.add_system_log(f"Gamma slug query empty. Triggering active markets cache refresh fallback for {slug_5m}...")
@@ -629,8 +657,13 @@ class TradingEngine:
                                 if match:
                                     strike_val = float(match.group(1))
                                     
-                            strike = float(strike_val) if strike_val else self.spot_prices[symbol]
+                            strike = float(strike_val) if strike_val else current_spot
                             
+                            # Validate that the strike is within 0.5% of the current spot price
+                            if abs(strike - current_spot) / current_spot > 0.005:
+                                self.add_system_log(f"[WARNING] Stale strike price (${strike:.2f}) parsed from details for {slug_5m} (spot is ${current_spot:.2f}). Overriding with current spot price.")
+                                strike = current_spot
+                                
                             self.active_markets[slug_5m] = {
                                 "symbol": symbol,
                                 "slug": slug_5m,
@@ -650,14 +683,13 @@ class TradingEngine:
                             self.add_system_log(f"[WARNING] Stale or misaligned contract details returned for {slug_5m}: asset={details_asset}, suffix={details_suffix}. Ignored.")
                     else:
                         # Fallback mock details if the live round isn't created on Gamma API yet
-                        strike = self.spot_prices[symbol]
                         self.active_markets[slug_5m] = {
                             "symbol": symbol,
                             "slug": slug_5m,
                             "type": "5M",
                             "start_time": t_rounded_5m,
                             "close_time": close_time,
-                            "strike_price": strike,
+                            "strike_price": current_spot,
                             "id": f"mock-{t_rounded_5m}",
                             "clobTokenIds": [f"yes-{t_rounded_5m}", f"no-{t_rounded_5m}"],
                             "conditionId": f"cond-{t_rounded_5m}",
@@ -686,6 +718,15 @@ class TradingEngine:
                     
                 spot = self.spot_prices[symbol]
                 strike = market["strike_price"]
+                
+                # Hard Stop Pre-Flight Validation Rule
+                trigger_spot_price = spot
+                strike_price = strike
+                if abs(trigger_spot_price - strike_price) / trigger_spot_price > 0.005:
+                    self.add_system_log(f"[ERROR] Data mapping corruption detected for {slug}. Forcing cache flush.")
+                    if slug in self.active_markets:
+                        self.active_markets.pop(slug)
+                    continue
                 
                 # Strict boundary fence check: Time Delta <= 0.5 seconds
                 time_delta = float(market["close_time"]) - t_synced

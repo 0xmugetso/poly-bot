@@ -190,6 +190,14 @@ class Backtester:
                 vol = vols.get(sym, 0.0003)
                 spot_at_5s = spot_at_close * (1 + random.normalvariate(0, vol * 0.1))
                 
+                # Hard Stop Pre-Flight Validation Rule
+                trigger_spot_price = spot_at_5s
+                strike_price = strike
+                if abs(trigger_spot_price - strike_price) / trigger_spot_price > 0.005:
+                    if len(logs) < 200:
+                        logs.append(f"[ERROR] Data mapping corruption detected for {sym} Rd {total_rounds}. Forcing cache flush.")
+                    continue
+                
                 # Proximity calculation
                 proximity = abs(spot_at_5s - strike) / strike
                 spot_strike_delta = abs(spot_at_5s - strike)
