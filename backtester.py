@@ -258,38 +258,68 @@ class Backtester:
                     
                     # Evaluate Strategy B gates
                     if yes_in_range and obi > self.obi_cutoff:
-                        total_executions += 1
-                        cost = self.base_size
-                        shares = cost / price_yes
+                        # Simultaneous Tiered Price Ladder Slicing (3 limit orders)
+                        total_executions += 3
                         
                         is_win = (spot_at_close >= strike)
-                        pnl = (shares - cost) if is_win else -cost
+                        
+                        # Level 1, 2, 3
+                        l1_cost = 0.10 * self.base_size
+                        l2_cost = 0.30 * self.base_size
+                        l3_cost = 0.60 * self.base_size
+                        
+                        l1_shares = l1_cost / 0.030
+                        l2_shares = l2_cost / 0.020
+                        l3_shares = l3_cost / 0.010
+                        
+                        total_cost = self.base_size
+                        total_shares = l1_shares + l2_shares + l3_shares
+                        blended_price = total_cost / total_shares
+                        
+                        pnl = (total_shares - total_cost) if is_win else -total_cost
+                        
                         if is_win:
                             wins += 1
-                            gross_revenue += shares
+                            gross_revenue += total_shares
                         else:
                             losses += 1
+                            
                         round_pnl += pnl
                         traded = True
                         if len(logs) < 200:
-                            logs.append(f"[TRADE] Rd {total_rounds} {sym}: BUY YES @ ${price_yes:.3f} -> {'WIN' if is_win else 'LOSS'} (PnL: {pnl:+.2f}). Wallet: ${equity+round_pnl:.2f}")
-                        
+                            logs.append(f"[TRADE] Rd {total_rounds} {sym}: Tiered Bids Filled BUY YES @ Blended ${blended_price:.3f} -> {'WIN' if is_win else 'LOSS'} (PnL: {pnl:+.2f}). Wallet: ${equity+round_pnl:.2f}")
+                            
                     elif no_in_range and obi < -self.obi_cutoff:
-                        total_executions += 1
-                        cost = self.base_size
-                        shares = cost / price_no
+                        # Simultaneous Tiered Price Ladder Slicing (3 limit orders)
+                        total_executions += 3
                         
                         is_win = (spot_at_close < strike)
-                        pnl = (shares - cost) if is_win else -cost
+                        
+                        # Level 1, 2, 3
+                        l1_cost = 0.10 * self.base_size
+                        l2_cost = 0.30 * self.base_size
+                        l3_cost = 0.60 * self.base_size
+                        
+                        l1_shares = l1_cost / 0.030
+                        l2_shares = l2_cost / 0.020
+                        l3_shares = l3_cost / 0.010
+                        
+                        total_cost = self.base_size
+                        total_shares = l1_shares + l2_shares + l3_shares
+                        blended_price = total_cost / total_shares
+                        
+                        pnl = (total_shares - total_cost) if is_win else -total_cost
+                        
                         if is_win:
                             wins += 1
-                            gross_revenue += shares
+                            gross_revenue += total_shares
                         else:
                             losses += 1
+                            
                         round_pnl += pnl
                         traded = True
                         if len(logs) < 200:
-                            logs.append(f"[TRADE] Rd {total_rounds} {sym}: BUY NO @ ${price_no:.3f} -> {'WIN' if is_win else 'LOSS'} (PnL: {pnl:+.2f}). Wallet: ${equity+round_pnl:.2f}")
+                            logs.append(f"[TRADE] Rd {total_rounds} {sym}: Tiered Bids Filled BUY NO @ Blended ${blended_price:.3f} -> {'WIN' if is_win else 'LOSS'} (PnL: {pnl:+.2f}). Wallet: ${equity+round_pnl:.2f}")
                             
                     if not traded and (yes_in_range or no_in_range) and len(logs) < 200:
                         logs.append(f"[BLOCKED] Rd {total_rounds} {sym}: OBI ({obi:.3f}) momentum insufficient (YES/NO Ask: ${price_yes:.2f}/${price_no:.2f}).")

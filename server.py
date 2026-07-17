@@ -88,7 +88,8 @@ class DatabaseManager:
             time_delta_seconds DECIMAL(10, 4),
             block_reason VARCHAR(128),
             rejection_reason VARCHAR(64) DEFAULT NULL,
-            spot_strike_delta DECIMAL(16, 6) DEFAULT NULL
+            spot_strike_delta DECIMAL(16, 6) DEFAULT NULL,
+            parent_order_id VARCHAR(128) DEFAULT NULL
         );
         """
         
@@ -116,7 +117,8 @@ class DatabaseManager:
                                       ("time_delta_seconds", "DECIMAL(10, 4)"),
                                       ("block_reason", "VARCHAR(128)"),
                                       ("rejection_reason", "VARCHAR(64) DEFAULT NULL"),
-                                      ("spot_strike_delta", "DECIMAL(16, 6) DEFAULT NULL")]:
+                                      ("spot_strike_delta", "DECIMAL(16, 6) DEFAULT NULL"),
+                                      ("parent_order_id", "VARCHAR(128) DEFAULT NULL")]:
                     try:
                         cursor.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type};")
                         self.conn.commit()
@@ -149,17 +151,17 @@ class DatabaseManager:
 
     def insert_trade(self, id_, timestamp, slug, strategy, outcome, price, size, gas, status,
                      execution_mode="MAKER_LIMIT", strike_price=None, trigger_spot_price=None,
-                     time_delta_seconds=None, block_reason=None, rejection_reason=None, spot_strike_delta=None):
+                     time_delta_seconds=None, block_reason=None, rejection_reason=None, spot_strike_delta=None, parent_order_id=None):
         query = """
         INSERT INTO trades (id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
-                            execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+                            execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta, parent_order_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         if self.is_postgres:
             query = query.replace("?", "%s")
         self.execute(query, (id_, timestamp, slug, strategy, outcome, price, size, gas, status,
                              execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason,
-                             rejection_reason, spot_strike_delta))
+                             rejection_reason, spot_strike_delta, parent_order_id))
         
     def resolve_trade(self, id_, status, resolved_at):
         query = """
@@ -886,11 +888,10 @@ class TradingEngine:
                                 self.resting_limit_orders.remove(order)
 
                     # Evaluate execution triggers
-                    # Window: final -5 seconds to +2 seconds epoch boundaries
-                    if -5 <= time_remaining <= 2 and market["last_evaluated"] != t:
+                    # timing window: final -1 seconds to +3 seconds epoch boundaries (handles ultra-fast execution threads right up to t-1s past interval closure)
+                    if -1 <= time_remaining <= 3 and market["last_evaluated"] != t:
                         market["last_evaluated"] = t
                         
-                        # Strategy A is hard deprecated.
                         # We evaluate YES/NO only for Strategy B (Penny Sweeps) targeting $0.01 to $0.04
                         
                         # Check YES (Up)
@@ -902,17 +903,24 @@ class TradingEngine:
                         
                         if market.get("proximity_enabled", True):
                             obi = self.live_obi.get(market["symbol"], 0.0)
+                            parent_order_id = f"parent-{slug}-{t}"
                             
                             if yes_in_range:
                                 if obi > 0.65:
-                                    self.post_maker_limit_order(market, "Up", price_yes, "Strategy B (Penny Sweep)")
+                                    # Broadcast Tiered Price Ladder Slicing simultaneously
+                                    self.post_maker_limit_order(market, "Up", 0.030, "Strategy B (Penny Sweep)", budget_allocation=0.10, parent_order_id=parent_order_id)
+                                    self.post_maker_limit_order(market, "Up", 0.020, "Strategy B (Penny Sweep)", budget_allocation=0.30, parent_order_id=parent_order_id)
+                                    self.post_maker_limit_order(market, "Up", 0.010, "Strategy B (Penny Sweep)", budget_allocation=0.60, parent_order_id=parent_order_id)
                                     yes_triggered = True
                                 else:
                                     self.add_system_log(f"[Blocked] Up trigger skipped on {slug}: OBI ({obi:.3f}) <= 0.65")
                                     
                             if no_in_range:
                                 if obi < -0.65:
-                                    self.post_maker_limit_order(market, "Down", price_no, "Strategy B (Penny Sweep)")
+                                    # Broadcast Tiered Price Ladder Slicing simultaneously
+                                    self.post_maker_limit_order(market, "Down", 0.030, "Strategy B (Penny Sweep)", budget_allocation=0.10, parent_order_id=parent_order_id)
+                                    self.post_maker_limit_order(market, "Down", 0.020, "Strategy B (Penny Sweep)", budget_allocation=0.30, parent_order_id=parent_order_id)
+                                    self.post_maker_limit_order(market, "Down", 0.010, "Strategy B (Penny Sweep)", budget_allocation=0.60, parent_order_id=parent_order_id)
                                     no_triggered = True
                                 else:
                                     self.add_system_log(f"[Blocked] Down trigger skipped on {slug}: OBI ({obi:.3f}) >= -0.65")
@@ -1005,7 +1013,7 @@ class TradingEngine:
             await self.broadcast()
             await asyncio.sleep(1.0)
 
-    def post_maker_limit_order(self, market, outcome, price, strategy_name):
+    def post_maker_limit_order(self, market, outcome, price, strategy_name, budget_allocation=1.0, parent_order_id=None):
         """Simulates placing a resting maker limit order on the CLOB."""
         slug = market["slug"]
         
@@ -1014,7 +1022,7 @@ class TradingEngine:
         for order in self.resting_limit_orders:
             active_pools.add(order["slug"])
             
-        shares = self.max_position_size_usdc / price
+        shares = (self.max_position_size_usdc * budget_allocation) / price
         priority_gas_gwei = self.priority_gas_gwei
         spot = self.live_prices.get(market["symbol"], 0.0)
         strike = market.get("strike_price", 0.0)
@@ -1045,7 +1053,8 @@ class TradingEngine:
                 strike_price=strike,
                 trigger_spot_price=spot,
                 time_delta_seconds=time_delta,
-                block_reason="MAX_SIMULTANEOUS_TRADES"
+                block_reason="MAX_SIMULTANEOUS_TRADES",
+                parent_order_id=parent_order_id
             )
             return
 
@@ -1072,7 +1081,8 @@ class TradingEngine:
                 strike_price=strike,
                 trigger_spot_price=spot,
                 time_delta_seconds=time_delta,
-                block_reason="GAS_UNPROFITABLE"
+                block_reason="GAS_UNPROFITABLE",
+                parent_order_id=parent_order_id
             )
             return
 
@@ -1087,7 +1097,8 @@ class TradingEngine:
             "tx_hash": tx_hash,
             "strike_price": strike,
             "trigger_spot_price": spot,
-            "time_delta_seconds": time_delta
+            "time_delta_seconds": time_delta,
+            "parent_order_id": parent_order_id
         })
         
         # Record trade as LIMIT_POSTED
@@ -1108,10 +1119,11 @@ class TradingEngine:
             execution_mode="MAKER_LIMIT",
             strike_price=strike,
             trigger_spot_price=spot,
-            time_delta_seconds=time_delta
+            time_delta_seconds=time_delta,
+            parent_order_id=parent_order_id
         )
         
-        self.add_system_log(f"[MAKER LIMIT POSTED] t-{abs(market['time_remaining'])}s: Maker limit order placed on {slug} for {outcome} @ ${price:.3f}")
+        self.add_system_log(f"[MAKER LIMIT POSTED] Maker limit order placed on {slug} for {outcome} @ ${price:.3f} (size: {shares:.2f} shares)")
 
     async def latency_jitter_simulation(self):
         """Simulates network jitter of WebSocket connectivity and gas fluctuations."""
@@ -1389,7 +1401,7 @@ class TradingEngine:
         try:
             query = """
             SELECT id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
-                   execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta
+                   execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta, parent_order_id
             FROM trades
             ORDER BY timestamp_utc ASC;
             """
@@ -1405,7 +1417,7 @@ class TradingEngine:
                 "timestamp", "datetime_utc", "market_slug", "strategy_type", "execution_mode",
                 "side_outcome", "strike_price", "trigger_spot_price", "time_delta_seconds",
                 "entry_price", "shares_count", "usdc_size", "priority_gas_gwei", "pnl_status",
-                "block_reason", "rejection_reason", "spot_strike_delta", "transaction_hash"
+                "block_reason", "rejection_reason", "spot_strike_delta", "transaction_hash", "parent_order_id"
             ])
             
             for r in rows:
@@ -1425,6 +1437,7 @@ class TradingEngine:
                 block_reason = r[14] or ""
                 rejection = r[15] or ""
                 delta_spot_strike = float(r[16]) if r[16] is not None else 0.0
+                parent_order_id = r[17] or ""
                 
                 if isinstance(dt_utc, datetime):
                     ts_ms = int(dt_utc.timestamp() * 1000)
@@ -1453,7 +1466,7 @@ class TradingEngine:
                     
                 writer.writerow([
                     ts_ms, iso_str, slug, strat_mapped, mode, side_mapped, strike, spot, time_delta,
-                    price, size, round(price * size, 4), gas, status, block_reason, rejection, delta_spot_strike, tx_hash
+                    price, size, round(price * size, 4), gas, status, block_reason, rejection, delta_spot_strike, tx_hash, parent_order_id
                 ])
                 
             return output.getvalue(), filename
