@@ -87,9 +87,9 @@ class DatabaseManager:
             trigger_spot_price DECIMAL(12, 4),
             time_delta_seconds DECIMAL(10, 4),
             block_reason VARCHAR(128),
-            rejection_reason VARCHAR(64) DEFAULT NULL,
-            spot_strike_delta DECIMAL(16, 6) DEFAULT NULL,
-            parent_order_id VARCHAR(128) DEFAULT NULL
+            rejection_reason VARCHAR(255) DEFAULT 'NONE',
+            spot_strike_delta NUMERIC DEFAULT 0.0,
+            parent_order_id VARCHAR(255) DEFAULT NULL
         );
         """
         
@@ -109,21 +109,21 @@ class DatabaseManager:
             if not self.is_postgres:
                 self.conn.commit()
                 
-            # Migrations for SQLite if tables already exist
-            if not self.is_postgres:
-                for col, col_type in [("execution_mode", "VARCHAR(32) DEFAULT 'MAKER_LIMIT'"),
-                                      ("strike_price", "DECIMAL(12, 4)"),
-                                      ("trigger_spot_price", "DECIMAL(12, 4)"),
-                                      ("time_delta_seconds", "DECIMAL(10, 4)"),
-                                      ("block_reason", "VARCHAR(128)"),
-                                      ("rejection_reason", "VARCHAR(64) DEFAULT NULL"),
-                                      ("spot_strike_delta", "DECIMAL(16, 6) DEFAULT NULL"),
-                                      ("parent_order_id", "VARCHAR(128) DEFAULT NULL")]:
-                    try:
-                        cursor.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type};")
+            # Migrations for SQLite/PostgreSQL if tables already exist
+            for col, col_type in [("execution_mode", "VARCHAR(32) DEFAULT 'MAKER_LIMIT'"),
+                                  ("strike_price", "DECIMAL(12, 4)"),
+                                  ("trigger_spot_price", "DECIMAL(12, 4)"),
+                                  ("time_delta_seconds", "DECIMAL(10, 4)"),
+                                  ("block_reason", "VARCHAR(128)"),
+                                  ("rejection_reason", "VARCHAR(255) DEFAULT 'NONE'"),
+                                  ("spot_strike_delta", "NUMERIC DEFAULT 0.0"),
+                                  ("parent_order_id", "VARCHAR(255) DEFAULT NULL")]:
+                try:
+                    cursor.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type};")
+                    if not self.is_postgres:
                         self.conn.commit()
-                    except Exception:
-                        pass # column already exists
+                except Exception:
+                    pass # column already exists
             
             # Mainnet Purge: Clean up mock records on launch under production mode
             if os.environ.get("ENV") == "LIVE_MAINNET_TRADING":
@@ -152,63 +152,71 @@ class DatabaseManager:
     def insert_trade(self, id_, timestamp, slug, strategy, outcome, price, size, gas, status,
                      execution_mode="MAKER_LIMIT", strike_price=None, trigger_spot_price=None,
                      time_delta_seconds=None, block_reason=None, rejection_reason=None, spot_strike_delta=None, parent_order_id=None):
-        query = """
-        INSERT INTO trades (id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
-                            execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta, parent_order_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
-        """
-        if self.is_postgres:
-            query = query.replace("?", "%s")
-        self.execute(query, (id_, timestamp, slug, strategy, outcome, price, size, gas, status,
-                             execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason,
-                             rejection_reason, spot_strike_delta, parent_order_id))
+        try:
+            query = """
+            INSERT INTO trades (id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
+                                execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta, parent_order_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            if self.is_postgres:
+                query = query.replace("?", "%s")
+            self.execute(query, (id_, timestamp, slug, strategy, outcome, price, size, gas, status,
+                                 execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason,
+                                 rejection_reason, spot_strike_delta, parent_order_id))
+        except Exception as e:
+            self.log_fn(f"[DATABASE ERROR] insert_trade exception: {e}")
         
     def resolve_trade(self, id_, status, resolved_at):
-        query = """
-        UPDATE trades SET pnl_status = ?, resolved_at = ? WHERE id = ?
-        """
-        if self.is_postgres:
-            query = query.replace("?", "%s")
-            self.execute(query, (status, resolved_at, id_))
-        else:
-            self.execute(query, (status, resolved_at, id_))
-
-    def load_recent_trades(self, limit=50):
-        query = f"SELECT * FROM trades ORDER BY timestamp_utc DESC LIMIT {limit}"
-        cursor = self.execute(query)
-        if not cursor:
-            return []
-        
-        trades = []
-        rows = cursor.fetchall()
-        for r in rows:
+        try:
+            query = """
+            UPDATE trades SET pnl_status = ?, resolved_at = ? WHERE id = ?
+            """
             if self.is_postgres:
-                trades.append({
-                    "id": r[0],
-                    "timestamp_utc": r[1].strftime("%Y-%m-%dT%H:%M:%S.000Z") if hasattr(r[1], "strftime") else str(r[1]),
-                    "market_slug": r[2],
-                    "strategy": r[3],
-                    "outcome_bet": r[4],
-                    "entry_price": float(r[5]),
-                    "position_size": float(r[6]),
-                    "gas_fee_gwei": float(r[7]),
-                    "pnl_status": r[8],
-                    "resolved_at": r[9]
-                })
-            else:
-                trades.append({
-                    "id": r["id"],
-                    "timestamp_utc": r["timestamp_utc"],
-                    "market_slug": r["market_slug"],
-                    "strategy": r["strategy"],
-                    "outcome_bet": r["outcome_bet"],
-                    "entry_price": float(r["entry_price"]),
-                    "position_size": float(r["position_size"]),
-                    "gas_fee_gwei": float(r["gas_fee_gwei"]),
-                    "pnl_status": r["pnl_status"],
-                    "resolved_at": r["resolved_at"]
-                })
-        return trades[::-1]
+                query = query.replace("?", "%s")
+            self.execute(query, (status, resolved_at, id_))
+        except Exception as e:
+            self.log_fn(f"[DATABASE ERROR] resolve_trade exception: {e}")
+ 
+    def load_recent_trades(self, limit=50):
+        try:
+            query = f"SELECT * FROM trades ORDER BY timestamp_utc DESC LIMIT {limit}"
+            cursor = self.execute(query)
+            if not cursor:
+                return []
+            
+            trades = []
+            rows = cursor.fetchall()
+            for r in rows:
+                if self.is_postgres:
+                    trades.append({
+                        "id": r[0],
+                        "timestamp_utc": r[1].strftime("%Y-%m-%dT%H:%M:%S.000Z") if hasattr(r[1], "strftime") else str(r[1]),
+                        "market_slug": r[2],
+                        "strategy": r[3],
+                        "outcome_bet": r[4],
+                        "entry_price": float(r[5]) if r[5] is not None else 0.0,
+                        "position_size": float(r[6]) if r[6] is not None else 0.0,
+                        "gas_fee_gwei": float(r[7]) if r[7] is not None else 0.0,
+                        "pnl_status": r[8],
+                        "resolved_at": r[9]
+                    })
+                else:
+                    trades.append({
+                        "id": r["id"],
+                        "timestamp_utc": r["timestamp_utc"],
+                        "market_slug": r["market_slug"],
+                        "strategy": r["strategy"],
+                        "outcome_bet": r["outcome_bet"],
+                        "entry_price": float(r["entry_price"]) if r["entry_price"] is not None else 0.0,
+                        "position_size": float(r["position_size"]) if r["position_size"] is not None else 0.0,
+                        "gas_fee_gwei": float(r["gas_fee_gwei"]) if r["gas_fee_gwei"] is not None else 0.0,
+                        "pnl_status": r["pnl_status"],
+                        "resolved_at": r["resolved_at"]
+                    })
+            return trades[::-1]
+        except Exception as e:
+            self.log_fn(f"[DATABASE ERROR] load_recent_trades exception: {e}")
+            return []
         
     def save_daily_stats(self, date_str, balance, total_trades, win_rate, timestamp):
         check_query = "SELECT date_utc FROM daily_stats WHERE date_utc = ?"
