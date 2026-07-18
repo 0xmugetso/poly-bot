@@ -16,7 +16,7 @@ import {
   Terminal
 } from 'lucide-react';
 
-const PRICE_DECIMALS = { BTC: 1, ETH: 2, SOL: 2, XRP: 4, BNB: 2 };
+const PRICE_DECIMALS = { BTC: 1, ETH: 2, SOL: 2, XRP: 4 };
 
 // Helper component to flash numbers on updates
 function AnimatedValue({ value, format, colorType }) {
@@ -199,7 +199,7 @@ export default function App() {
   const [totalTrades, setTotalTrades] = useState(0);
   const [resolvedTrades, setResolvedTrades] = useState(0);
   const [spotPrices, setSpotPrices] = useState({
-    BTC: 67250.0, ETH: 3480.0, SOL: 142.50, XRP: 0.58, BNB: 585.0
+    BTC: 67250.0, ETH: 3480.0, SOL: 142.50, XRP: 0.58
   });
   const [activeMarkets, setActiveMarkets] = useState([]);
   const [activityLog, setActivityLog] = useState([]);
@@ -219,7 +219,7 @@ export default function App() {
   const [isPausedStream, setIsPausedStream] = useState(false);
   const [equityHistory, setEquityHistory] = useState([1420.55]);
   const [logFilter, setLogFilter] = useState("ALL"); // ALL, TRADES, BLOCKED, SYSTEM
-  const [liveObi, setLiveObi] = useState({ BTC: 0.0, ETH: 0.0, SOL: 0.0, XRP: 0.0, BNB: 0.0 });
+  const [liveObi, setLiveObi] = useState({ BTC: 0.0, ETH: 0.0, SOL: 0.0, XRP: 0.0 });
   const [clobClockOffset, setClobClockOffset] = useState(0.0);
   const [currentTimes, setCurrentTimes] = useState({ local: "", utc: "", clob: "" });
   const [userHasScrolledUp, setUserHasScrolledUp] = useState(false);
@@ -495,41 +495,40 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#09090B] text-slate-100 p-4 font-sans select-none flex flex-col justify-between">
       {/* 1. Header Bar */}
-      <header className="flex items-center justify-between border-b border-[#1E1E2F] pb-4 mb-4">
-        <div className="flex items-center gap-6">
-          <div className="relative flex items-center justify-center">
-            <span className={`w-3.5 h-3.5 rounded-full ${status === 'RUNNING' && connected ? 'bg-emerald-500 pulse-green' : 'bg-rose-500'}`} />
-          </div>
-          <div className="flex flex-col">
-            <h1 className="text-lg font-bold tracking-widest text-[#F8FAFC]">
-              POLY-BOT <span className="text-[#10B981]">//</span> {activeTab === "live" ? "LIVE" : "SIM"}
-            </h1>
-            <span className="text-[10px] uppercase font-mono tracking-wider text-slate-500">
-              Web3 Latency Arbitrage & Sweeper
-            </span>
+      <header className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-[#1E1E2F] pb-4 mb-4">
+        <div className="flex items-center justify-between w-full md:w-auto gap-4">
+          <div className="flex items-center gap-3">
+            <span className={`w-3 h-3 rounded-full ${status === 'RUNNING' && connected ? 'bg-emerald-500 pulse-green' : 'bg-rose-500'}`} />
+            <div className="flex flex-col">
+              <h1 className="text-base sm:text-lg font-bold tracking-widest text-[#F8FAFC]">
+                POLY-BOT <span className="text-[#10B981]">//</span> {activeTab === "live" ? "LIVE" : "SIM"}
+              </h1>
+              <span className="text-[9px] sm:text-[10px] uppercase font-mono tracking-wider text-slate-500">
+                Web3 Latency Arbitrage & Sweeper
+              </span>
+            </div>
           </div>
           
-          {/* Tab selector pills */}
           <div className="flex bg-[#040407] border border-[#1E1E2F] p-0.5 rounded gap-0.5 font-mono text-[9px] uppercase tracking-wider">
             <button 
               onClick={() => setActiveTab("live")}
-              className={`px-3 py-1 rounded transition-colors ${
+              className={`px-2.5 py-1 rounded transition-colors ${
                 activeTab === "live" 
                   ? "bg-slate-800 text-slate-200 font-bold" 
                   : "text-slate-500 hover:text-slate-300"
               }`}
             >
-              Live Terminal
+              Live
             </button>
             <button 
               onClick={() => setActiveTab("backtest")}
-              className={`px-3 py-1 rounded transition-colors ${
+              className={`px-2.5 py-1 rounded transition-colors ${
                 activeTab === "backtest" 
                   ? "bg-slate-800 text-slate-200 font-bold" 
                   : "text-slate-500 hover:text-slate-300"
               }`}
             >
-              Backtest & Sim
+              Backtest
             </button>
           </div>
         </div>
@@ -554,17 +553,17 @@ export default function App() {
           </div>
         </div>
 
-        <div className="flex items-center gap-6">
-          <div className="text-right hidden sm:block">
-            <span className="text-[10px] text-slate-500 uppercase block font-mono">Simulated Wallet Balance</span>
-            <span className="text-base font-mono-val font-semibold text-slate-200">
+        <div className="flex items-center justify-between md:justify-end gap-4 sm:gap-6 w-full md:w-auto flex-wrap">
+          <div className="text-right sm:block">
+            <span className="text-[9px] text-slate-500 uppercase block font-mono">Wallet Balance</span>
+            <span className="text-xs sm:text-sm font-mono-val font-semibold text-slate-200">
               ${wallet.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDC
             </span>
           </div>
           
           <div className="text-right">
-            <span className="text-[10px] text-slate-500 uppercase block font-mono">Net Profit (Live)</span>
-            <span className={`text-base font-mono-val font-semibold ${netPnlUsdc >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+            <span className="text-[9px] text-slate-500 uppercase block font-mono">Net Profit (Live)</span>
+            <span className={`text-xs sm:text-sm font-mono-val font-semibold ${netPnlUsdc >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
               {netPnlUsdc >= 0 ? '+' : ''}${netPnlUsdc.toFixed(2)} USDC
             </span>
           </div>
@@ -572,11 +571,11 @@ export default function App() {
           <div className="flex items-center gap-2">
             <button 
               onClick={handleExportCsv}
-              className="px-3 py-1.5 rounded border border-sky-900/50 bg-sky-950/20 text-sky-400 hover:bg-sky-950/40 text-xs font-medium transition-colors flex items-center gap-1.5"
+              className="px-2.5 py-1.5 rounded border border-sky-900/50 bg-sky-950/20 text-sky-400 hover:bg-sky-950/40 text-[10px] sm:text-xs font-medium transition-colors flex items-center gap-1.5"
               title="Export Telemetry Logs"
             >
-              <Download size={13} />
-              <span>Export Logs</span>
+              <Download size={12} />
+              <span>Export</span>
             </button>
           </div>
         </div>
@@ -718,7 +717,7 @@ export default function App() {
               <Activity size={12} /> Active Scanned Markets
             </h3>
             
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
               {activeMarkets.map((market) => {
                 let statusColor = "bg-emerald-500 pulse-green";
                 let statusText = "STABLE";
