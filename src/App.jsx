@@ -401,6 +401,32 @@ export default function App() {
     }
   };
 
+  const handleExportBacktestCsv = () => {
+    if (backtestLogs.length === 0) return;
+    const headers = ["Index", "Category", "Log Message"];
+    const rows = backtestLogs.map((log, idx) => {
+      let category = "SYSTEM";
+      if (log.includes("[TRADE]")) category = "TRADE";
+      else if (log.includes("[BLOCKED]")) category = "BLOCKED";
+      else if (log.includes("[DATA]")) category = "DATA";
+      else if (log.includes("[EXPIRED_UNFILLED]")) category = "EXPIRED_UNFILLED";
+      else if (log.includes("[WARNING]")) category = "WARNING";
+      else if (log.includes("[LIQUIDATED]")) category = "LIQUIDATED";
+      
+      const cleanLog = log.replace(/"/g, '""');
+      return [idx + 1, category, `"${cleanLog}"`].join(",");
+    });
+    const csvContent = [headers.join(","), ...rows].join("\n");
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `poly_bot_backtest_logs_${new Date().toISOString().split('T')[0]}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   const handleRunBacktest = () => {
     if (ws.current && ws.current.readyState === WebSocket.OPEN) {
       setBacktesting(true);
@@ -1098,9 +1124,15 @@ export default function App() {
 
                 {/* Backtest Process Monitor Logs Console */}
                 <div className="bg-zinc-950/60 border border-[#1E1E2F]/80 rounded flex flex-col h-[280px]">
-                  <div className="px-4 py-2.5 border-b border-[#1E1E2F]/60 flex items-center justify-between">
+                  <div className="px-4 py-2 flex items-center justify-between border-b border-[#1E1E2F]/60">
                     <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider">Simulation Decisional Telemetry Logs</span>
-                    <span className="text-[9px] font-mono text-slate-600 uppercase">ReadOnly Feed</span>
+                    <button 
+                      onClick={handleExportBacktestCsv}
+                      disabled={backtestLogs.length === 0}
+                      className="px-2.5 py-1 rounded border border-[#1E1E2F] bg-slate-900/60 hover:bg-slate-800 text-slate-300 text-[10px] font-mono tracking-wider transition-colors disabled:opacity-40"
+                    >
+                      Export CSV
+                    </button>
                   </div>
                   <div className="flex-grow p-4 overflow-y-auto font-mono text-xs leading-relaxed space-y-1.5 flex flex-col justify-start">
                     {backtestLogs.map((log, idx) => {
