@@ -760,7 +760,15 @@ export default function App() {
                     <div className="flex items-center justify-between border-b border-[#1E1E2F]/60 pb-1.5">
                       <div className="flex items-center gap-1.5">
                         <span className={`w-2 h-2 rounded-full ${statusColor}`} title={`Status: ${statusText}`} />
-                        <span className="text-xs font-bold text-slate-200">{market.symbol} ({market.type})</span>
+                        <a 
+                          href={`https://polymarket.com/event/${market.slug}`} 
+                          target="_blank" 
+                          rel="noreferrer"
+                          className="text-xs font-bold text-slate-200 hover:text-[#10B981] flex items-center gap-1"
+                        >
+                          <span>{market.symbol} ({market.type})</span>
+                          <ExternalLink size={10} />
+                        </a>
                       </div>
                       <span className={`text-[10px] font-mono font-medium px-1.5 py-0.5 rounded ${
                         market.time_remaining <= 5 ? 'bg-rose-950/40 text-rose-400 border border-rose-900/40' : 'bg-slate-900 text-slate-400'
@@ -830,7 +838,17 @@ export default function App() {
                       return (
                         <tr key={act.tx_hash} className={`hover:bg-[#121216]/50 transition-colors ${isBlocked ? 'text-slate-500/80 bg-slate-950/20' : ''}`}>
                           <td className="px-4 py-2.5 text-slate-500">{timeStr}</td>
-                          <td className={`px-4 py-2.5 font-bold ${isBlocked ? 'text-slate-500' : 'text-slate-300'}`}>{mktSymbol}-{mktInterval}</td>
+                          <td className={`px-4 py-2.5 font-bold ${isBlocked ? 'text-slate-500' : 'text-slate-300'}`}>
+                            <a 
+                              href={`https://polymarket.com/event/${act.slug}`} 
+                              target="_blank" 
+                              rel="noreferrer"
+                              className="hover:text-[#10B981] inline-flex items-center gap-1.5"
+                            >
+                              <span>{mktSymbol}-{mktInterval}</span>
+                              <ExternalLink size={10} />
+                            </a>
+                          </td>
                           <td className="px-4 py-2.5 text-slate-500">BUY {act.outcome}</td>
                           <td className={`px-4 py-2.5 text-right font-semibold ${isBlocked ? 'text-slate-500' : 'text-slate-200'}`}>
                             {isBlocked ? "—" : `$${act.price.toFixed(3)}`}
