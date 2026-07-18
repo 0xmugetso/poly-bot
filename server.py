@@ -338,10 +338,24 @@ class TradingEngine:
             self.net_pnl_pct = (self.net_pnl_usdc / self.initial_wallet) * 100
             self.add_system_log(f"State rehydrated. Current Wallet Balance: ${self.wallet:.2f} USDC | Wins: {self.wins} | Losses: {self.losses}")
 
-    def add_activity(self, slug, outcome, price, size, status, tx_hash=None):
+    def add_activity(self, slug, outcome, price, size, status, tx_hash=None, reason=None):
         if not tx_hash:
             tx_hash = f"0x{random.randbytes(32).hex()}"
         
+        if not reason:
+            if status == "WIN":
+                reason = "Target outcome resolved successfully (Profit secured)"
+            elif status == "LOSS":
+                reason = "Target outcome expired worthless (Loss incurred)"
+            elif status == "LIMIT_POSTED":
+                reason = "Maker Limit Order posted to orderbook tail (Waiting for fill)"
+            elif status == "PENDING":
+                reason = "Limit order filled (Waiting for outcome resolution)"
+            elif status == "CANCELLED":
+                reason = "Failsafe active: Order cancelled before expiry"
+            else:
+                reason = "Status updated"
+
         trade = {
             "datetime_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             "slug": slug,
@@ -349,7 +363,8 @@ class TradingEngine:
             "price": price,
             "size": size,
             "status": status,
-            "tx_hash": tx_hash
+            "tx_hash": tx_hash,
+            "reason": reason
         }
         self.activity_log.append(trade)
         if len(self.activity_log) > 50:
@@ -757,6 +772,7 @@ class TradingEngine:
                     for trade in self.activity_log:
                         if trade["slug"] == slug and trade["status"] == "LIMIT_POSTED":
                             trade["status"] = "CANCELLED"
+                            trade["reason"] = "Failsafe active: Synced time delta expired before order fill"
                             self.db.resolve_trade(trade["tx_hash"], "CANCELLED", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
                 
                 # Proximity checks completely removed per Order Book Shadowing pivot
@@ -818,9 +834,10 @@ class TradingEngine:
                                     
                                     if matched_trade:
                                         matched_trade["status"] = "PENDING"
+                                        matched_trade["reason"] = "Resting limit order filled by market taker"
                                         self.db.resolve_trade(order["tx_hash"], "PENDING", None)
                                     else:
-                                        trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "PENDING", order["tx_hash"])
+                                        trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "PENDING", order["tx_hash"], reason="Resting limit order filled by market taker")
                                         trade["strategy"] = order["strategy"]
                                         self.db.insert_trade(
                                             order["tx_hash"], 
@@ -902,6 +919,7 @@ class TradingEngine:
                             is_win = (trade["outcome"] == winner)
                             if is_win:
                                 trade["status"] = "WIN"
+                                trade["reason"] = f"Target outcome resolved successfully: {trade['outcome']} won at close"
                                 self.wins += 1
                                 if "Arbitrage" in trade.get("strategy", ""):
                                     self.arbitrage_wins += 1
@@ -912,6 +930,7 @@ class TradingEngine:
                                 self.net_pnl_usdc += (payout - (trade["size"] * trade["price"]))
                             else:
                                 trade["status"] = "LOSS"
+                                trade["reason"] = f"Target outcome expired worthless: opposite outcome won at close"
                                 self.losses += 1
                                 self.net_pnl_usdc -= (trade["size"] * trade["price"])
                             
@@ -940,6 +959,7 @@ class TradingEngine:
                     for trade in self.activity_log:
                         if trade["slug"] == slug and trade["status"] == "LIMIT_POSTED":
                             trade["status"] = "CANCELLED"
+                            trade["reason"] = "Failsafe active: Order cancelled before expiry"
                             self.db.resolve_trade(trade["tx_hash"], "CANCELLED", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
                     
                     # Remove from active listing

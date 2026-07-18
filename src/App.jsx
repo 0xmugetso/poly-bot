@@ -813,8 +813,8 @@ export default function App() {
                           <td className={`px-4 py-2.5 text-right ${isBlocked ? 'text-slate-500' : 'text-slate-300'}`}>
                             {isBlocked ? "—" : act.size.toLocaleString(undefined, { maximumFractionDigits: 1 })}
                           </td>
-                          <td className="px-4 py-2.5 text-center">
-                            <span className={`text-[10px] px-2 py-0.5 rounded font-bold ${badgeClass}`}>
+                          <td className="px-4 py-2.5 text-center" title={act.reason || "No status reason provided"}>
+                            <span className={`text-[10px] px-2 py-0.5 rounded font-bold cursor-help ${badgeClass}`}>
                               {act.status}
                             </span>
                           </td>
