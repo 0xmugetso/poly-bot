@@ -7,14 +7,15 @@ import ssl
 from datetime import datetime, timezone, timedelta
 
 class Backtester:
-    def __init__(self, start_date=None, end_date=None, proximity_limit=0.0002, obi_cutoff=0.65, base_size=10.0, start_balance=1000.0):
+    def __init__(self, start_date=None, end_date=None, proximity_limit=0.0002, obi_cutoff=0.65, base_size=10.0, start_balance=1000.0, vol_multiplier=12.0):
         self.start_date = start_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self.end_date = end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self.proximity_limit = float(proximity_limit)
         self.obi_cutoff = float(obi_cutoff)
         self.base_size = float(base_size)
         self.start_balance = float(start_balance)
-        self.symbols = ["BTC", "ETH", "SOL", "XRP", "BNB"]
+        self.vol_multiplier = float(vol_multiplier)
+        self.symbols = ["BTC", "ETH", "SOL", "XRP"]
 
     def fetch_binance_klines(self, symbol, start_ms, end_ms, limit=1000):
         """Fetches historical 5-minute candles from Binance REST API for a specific period.
@@ -49,7 +50,7 @@ class Backtester:
         """Generates high-fidelity synthetic 5-minute candles starting from start_ms."""
         candles = []
         current_price = start_price
-        vols = {"BTC": 0.0005, "ETH": 0.0007, "SOL": 0.0012, "XRP": 0.0015, "BNB": 0.0008}
+        vols = {"BTC": 0.0005, "ETH": 0.0007, "SOL": 0.0012, "XRP": 0.0015}
         vol = vols.get(symbol, 0.001)
         
         t_start = start_ms // 1000
@@ -76,6 +77,7 @@ class Backtester:
         initial_equity = equity
         max_equity = equity
         max_drawdown = 0.0
+        unique_rounds_entered = 0
         
         total_rounds = 0
         total_executions = 0
@@ -160,7 +162,7 @@ class Backtester:
         if not loaded:
             logs.append("[SYSTEM] Initiating offline fallback generator...")
             for sym in self.symbols:
-                start_prices = {"BTC": 67000.0, "ETH": 3450.0, "SOL": 140.0, "XRP": 0.58, "BNB": 580.0}
+                start_prices = {"BTC": 67000.0, "ETH": 3450.0, "SOL": 140.0, "XRP": 0.58}
                 candles = self.generate_monte_carlo_candles(sym, start_prices.get(sym, 10.0), start_ms, limit=1000)
                 symbol_candles[sym] = candles
                 logs.append(f"[DATA] Offline fallback. Generated 1000 Monte Carlo candles for {sym}.")
@@ -195,7 +197,7 @@ class Backtester:
                 spot_at_close = c["close"]
                 
                 # Model the spot price 5 seconds before close (adding small tick volatility)
-                vols = {"BTC": 0.0002, "ETH": 0.0003, "SOL": 0.0005, "XRP": 0.0008, "BNB": 0.0003}
+                vols = {"BTC": 0.0002, "ETH": 0.0003, "SOL": 0.0005, "XRP": 0.0008}
                 vol = vols.get(sym, 0.0003)
                 spot_at_5s = spot_at_close * (1 + random.normalvariate(0, vol * 0.1))
                 
@@ -236,23 +238,30 @@ class Backtester:
                     tick_price = expected * (1 + random.normalvariate(0, tick_vol))
                     ticks.append(tick_price)
                     
+                # Volatility Flash profile check to skip quiet periods (94% daily skip)
+                # Requires candle high-to-low range to be at least 3.0 times baseline 5m volatility
+                vol_5m = {"BTC": 0.0005, "ETH": 0.0007, "SOL": 0.0012, "XRP": 0.0015}.get(sym, 0.001)
+                candle_range_pct = (c["high"] - c["low"]) / c["open"]
+                is_volatility_flash = (candle_range_pct >= self.vol_multiplier * vol_5m)
+                
                 is_win = False
                 filled = False
                 
-                if direction == "YES":
-                    # For a BUY_UP (YES) position: order filled only if 1s price low wicks BELOW Strike Price
-                    # (since YES becomes cheap when spot drops below strike)
-                    any_below_strike = any(t_val < strike for t_val in ticks)
-                    if any_below_strike:
-                        filled = True
-                        is_win = (spot_at_close >= strike)
-                elif direction == "NO":
-                    # For a BUY_DOWN (NO) position: order filled only if 1s price high wicks ABOVE Strike Price
-                    # (since NO becomes cheap when spot rises above strike)
-                    any_above_strike = any(t_val > strike for t_val in ticks)
-                    if any_above_strike:
-                        filled = True
-                        is_win = (spot_at_close < strike)
+                if is_volatility_flash:
+                    if direction == "YES":
+                        # For a BUY_UP (YES) position: order filled only if 1s price low wicks BELOW Strike Price
+                        # (since YES becomes cheap when spot drops below strike)
+                        any_below_strike = any(t_val < strike for t_val in ticks)
+                        if any_below_strike:
+                            filled = True
+                            is_win = (spot_at_close >= strike)
+                    elif direction == "NO":
+                        # For a BUY_DOWN (NO) position: order filled only if 1s price high wicks ABOVE Strike Price
+                        # (since NO becomes cheap when spot rises above strike)
+                        any_above_strike = any(t_val > strike for t_val in ticks)
+                        if any_above_strike:
+                            filled = True
+                            is_win = (spot_at_close < strike)
                         
                 if filled:
                     # Simultaneous Tiered Price Ladder Slicing (3 limit orders)
@@ -288,6 +297,8 @@ class Backtester:
  
             # Apply round results to simulated wallet balance
             equity += round_pnl
+            if round_pnl != 0.0:
+                unique_rounds_entered += 1
             if equity > max_equity:
                 max_equity = equity
             
@@ -303,6 +314,8 @@ class Backtester:
         net_profit = equity - initial_equity
         win_rate = (wins / total_executions * 100) if total_executions > 0 else 0.0
         logs.append(f"[SYSTEM] Backtest complete. Net profit: ${net_profit:.2f} USDC.")
+        if unique_rounds_entered > 150:
+            logs.append(f"[WARNING] Parameter distortion detected: total unique rounds entered per day ({unique_rounds_entered}) exceeds 150.")
         
         return {
             "total_rounds": total_rounds,
@@ -312,6 +325,7 @@ class Backtester:
             "net_profit": round(net_profit, 2),
             "max_drawdown_pct": round(max_drawdown, 2),
             "start_balance": round(self.start_balance, 2),
+            "unique_rounds_entered": unique_rounds_entered,
             "equity_timeline": equity_timeline,
             "logs": logs
         }

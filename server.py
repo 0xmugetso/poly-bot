@@ -267,12 +267,12 @@ class TradingEngine:
         self.env = os.environ.get("ENV", "SIMULATION")
         
         # Live market tracking
-        self.live_prices = {"BTC": 67250.0, "ETH": 3480.0, "SOL": 142.50, "XRP": 0.58, "BNB": 585.0}
+        self.live_prices = {"BTC": 67250.0, "ETH": 3480.0, "SOL": 142.50, "XRP": 0.58}
         self.spot_prices = self.live_prices
-        self.live_obi = {"BTC": 0.0, "ETH": 0.0, "SOL": 0.0, "XRP": 0.0, "BNB": 0.0}
-        self.price_decimals = {"BTC": 1, "ETH": 2, "SOL": 2, "XRP": 4, "BNB": 2}
+        self.live_obi = {"BTC": 0.0, "ETH": 0.0, "SOL": 0.0, "XRP": 0.0}
+        self.price_decimals = {"BTC": 1, "ETH": 2, "SOL": 2, "XRP": 4}
         self.active_markets = {}  # symbol -> market_details
-        self.symbols = ["BTC", "ETH", "SOL", "XRP", "BNB"]
+        self.symbols = ["BTC", "ETH", "SOL", "XRP"]
         self.rolling_prices = {sym: [] for sym in self.symbols}
         self.volatility_coefficient = 0.15
         
@@ -601,8 +601,8 @@ class TradingEngine:
         return None
 
     async def market_management_loop(self):
-        """Periodically syncs active 5M/15M markets and resolves rounds."""
-        symbols = ["BTC", "ETH", "SOL", "XRP", "BNB"]
+        """Periodically syncs active 5M markets and resolves rounds."""
+        symbols = ["BTC", "ETH", "SOL", "XRP"]
         
         while True:
             if self.status != "RUNNING":
@@ -627,7 +627,7 @@ class TradingEngine:
                     self.add_system_log(f"Syncing active contract details for: {slug_5m}")
                     
                     # Fetch real spot price first (bypass startup stale default race condition)
-                    stale_defaults = {"BTC": 67250.0, "ETH": 3480.0, "SOL": 142.50, "XRP": 0.58, "BNB": 585.0}
+                    stale_defaults = {"BTC": 67250.0, "ETH": 3480.0, "SOL": 142.50, "XRP": 0.58}
                     current_spot = self.spot_prices[symbol]
                     if current_spot == stale_defaults.get(symbol):
                         try:
@@ -1280,7 +1280,8 @@ class TradingEngine:
                 proximity_limit=proximity_limit,
                 obi_cutoff=obi_cutoff,
                 base_size=base_size,
-                start_balance=start_balance
+                start_balance=start_balance,
+                vol_multiplier=4.8
             )
             return backtester.run()
         except Exception as e:
