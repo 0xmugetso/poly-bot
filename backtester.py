@@ -181,6 +181,11 @@ class Backtester:
         rolling_closes = {sym: [] for sym in self.symbols}
         
         for idx in range(data_len):
+            # Strict Capital Liquidation Check
+            if equity < self.base_size:
+                logs.append(f"[LIQUIDATED] Simulation halted at round {total_rounds}. Account balance (${equity:.2f}) dropped below required position size (${self.base_size:.1f}).")
+                break
+                
             total_rounds += 1
             round_pnl = 0.0
             
@@ -207,33 +212,49 @@ class Backtester:
                 base_obi = max(-0.95, min(0.95, base_obi))
                 obi = base_obi + random.uniform(-0.1, 0.1)
                 
-                # Model YES/NO contract prices to verify penny fill feasibility (must be <= $0.05)
-                delta = spot_at_5s - strike
-                volatility_factor = spot_at_5s * vol * 0.1 * 1.2
-                val = -delta / volatility_factor
-                price_yes = 1 / (1 + 2.718 ** max(-50.0, min(50.0, val)))
-                price_yes = max(0.01, min(0.99, price_yes))
-                price_no = 1.0 - price_yes
-                
-                is_win = False
-                traded = False
+                # OBI determines the direction:
+                # If OBI > 0 -> BUY_UP (YES)
+                # If OBI < 0 -> BUY_DOWN (NO)
                 direction = ""
-                
-                # OBI directional evaluation with feasibility check
                 if obi > 0.0:
-                    # Direction = BUY_UP (YES). Bids only filled if the contract is cheap (price <= 0.05)
-                    if price_yes <= 0.05:
-                        direction = "YES"
-                        is_win = (spot_at_close >= strike)
-                        traded = True
+                    direction = "YES"
                 elif obi < 0.0:
-                    # Direction = BUY_DOWN (NO). Bids only filled if the contract is cheap (price <= 0.05)
-                    if price_no <= 0.05:
-                        direction = "NO"
-                        is_win = (spot_at_close < strike)
-                        traded = True
+                    direction = "NO"
+                else:
+                    if len(logs) < 200:
+                        logs.append(f"[BLOCKED] Rd {total_rounds} {sym}: OBI is exactly 0.0.")
+                    continue
+                
+                # Generate high-fidelity 1-second ticks in final 3 seconds to determine if fill wicks cross the strike line
+                # We interpolate between spot_at_5s and spot_at_close
+                ticks = []
+                steps = 3
+                for step in range(steps):
+                    weight = (step + 1) / steps
+                    expected = spot_at_5s + (spot_at_close - spot_at_5s) * weight
+                    tick_vol = vol * 0.1 / math.sqrt(60.0) # 1s volatility is roughly 1/sqrt(60) of 5m
+                    tick_price = expected * (1 + random.normalvariate(0, tick_vol))
+                    ticks.append(tick_price)
                     
-                if traded:
+                is_win = False
+                filled = False
+                
+                if direction == "YES":
+                    # For a BUY_UP (YES) position: order filled only if 1s price low wicks BELOW Strike Price
+                    # (since YES becomes cheap when spot drops below strike)
+                    any_below_strike = any(t_val < strike for t_val in ticks)
+                    if any_below_strike:
+                        filled = True
+                        is_win = (spot_at_close >= strike)
+                elif direction == "NO":
+                    # For a BUY_DOWN (NO) position: order filled only if 1s price high wicks ABOVE Strike Price
+                    # (since NO becomes cheap when spot rises above strike)
+                    any_above_strike = any(t_val > strike for t_val in ticks)
+                    if any_above_strike:
+                        filled = True
+                        is_win = (spot_at_close < strike)
+                        
+                if filled:
                     # Simultaneous Tiered Price Ladder Slicing (3 limit orders)
                     total_executions += 3
                     
@@ -261,12 +282,10 @@ class Backtester:
                     if len(logs) < 200:
                         logs.append(f"[TRADE] Rd {total_rounds} {sym}: Tiered Bids Filled BUY {direction} @ Blended ${blended_price:.3f} -> {'WIN' if is_win else 'LOSS'} (PnL: {pnl:+.2f}). Wallet: ${equity+round_pnl:.2f}")
                 else:
+                    # Fallback: log as EXPIRED_UNFILLED with $0.00 USDC cost change
                     if len(logs) < 200:
-                        if obi == 0.0:
-                            logs.append(f"[BLOCKED] Rd {total_rounds} {sym}: OBI is exactly 0.0.")
-                        else:
-                            logs.append(f"[BLOCKED] Rd {total_rounds} {sym}: Bids not filled (Estimated YES/NO: ${price_yes:.2f}/${price_no:.2f}).")
-
+                        logs.append(f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: Strike line never intersected during final 3s. Bids expired unfilled ($0.00 USDC cost).")
+ 
             # Apply round results to simulated wallet balance
             equity += round_pnl
             if equity > max_equity:
