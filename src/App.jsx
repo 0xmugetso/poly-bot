@@ -231,7 +231,8 @@ export default function App() {
     endDate: new Date().toISOString().slice(0, 10),
     proximityLimit: 0.15,
     obiCutoff: 0.65,
-    baseSize: 10.0
+    baseSize: 10.0,
+    startBalance: 1000.0
   });
   const [backtestResults, setBacktestResults] = useState(null);
   const [backtesting, setBacktesting] = useState(false);
@@ -851,7 +852,7 @@ export default function App() {
             <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded flex flex-col h-[400px]">
               <div className="px-4 py-3 border-b border-[#1E1E2F]/60 flex items-center justify-between">
                 <h3 className="text-xs uppercase font-mono tracking-widest text-[#10B981] flex items-center gap-1.5">
-                  <Terminal size={12} /> System Process Monitor (timestamps in server local time)
+                  <Terminal size={12} /> System Process Monitor
                 </h3>
                 
                 <div className="flex items-center gap-2">
@@ -974,6 +975,18 @@ export default function App() {
               </div>
 
               <div className="flex flex-col gap-1.5">
+                <label className="text-[10px] font-mono text-slate-500 uppercase">Starting Balance (USDC)</label>
+                <input 
+                  type="number"
+                  step="100"
+                  value={backtestParams.startBalance}
+                  onChange={(e) => setBacktestParams(prev => ({ ...prev, startBalance: parseFloat(e.target.value) || 0 }))}
+                  disabled={backtesting}
+                  className="bg-[#040407] border border-[#1E1E2F] rounded px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-emerald-500 w-full"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1.5">
                 <label className="text-[10px] font-mono text-slate-500 uppercase">Mock Position Size ($)</label>
                 <input 
                   type="number"
@@ -1055,10 +1068,22 @@ export default function App() {
                     <span className="text-[9px] text-slate-500 uppercase font-mono tracking-wider">Gross Revenue</span>
                     <span className="text-lg font-mono-val font-bold text-slate-200">${backtestResults.gross_revenue}</span>
                   </div>
-                  <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col gap-1">
+                   <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col gap-1">
                     <span className="text-[9px] text-slate-500 uppercase font-mono tracking-wider">Net Profit</span>
                     <span className={`text-lg font-mono-val font-bold ${backtestResults.net_profit >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                       ${backtestResults.net_profit >= 0 ? '+' : ''}{backtestResults.net_profit} USDC
+                    </span>
+                  </div>
+                  <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col gap-1">
+                    <span className="text-[9px] text-slate-500 uppercase font-mono tracking-wider">Start Balance</span>
+                    <span className="text-lg font-mono-val font-bold text-slate-200">
+                      ${backtestResults.start_balance || 1000} USDC
+                    </span>
+                  </div>
+                  <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col gap-1">
+                    <span className="text-[9px] text-slate-500 uppercase font-mono tracking-wider">Simulation ROI</span>
+                    <span className={`text-lg font-mono-val font-bold ${backtestResults.net_profit >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {backtestResults.net_profit >= 0 ? '+' : ''}{((backtestResults.net_profit / (backtestResults.start_balance || 1000.0)) * 100).toFixed(2)}%
                     </span>
                   </div>
                   <div className="bg-[#0D0D0D] border border-[#1E1E2F] rounded p-4 flex flex-col gap-1">

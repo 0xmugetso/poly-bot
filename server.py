@@ -1252,13 +1252,15 @@ class TradingEngine:
             proximity_limit = float(params.get("proximityLimit", 0.15))
             obi_cutoff = float(params.get("obiCutoff", 0.65))
             base_size = float(params.get("baseSize", 10.0))
+            start_balance = float(params.get("startBalance", 1000.0))
             
             backtester = Backtester(
                 start_date=start_date,
                 end_date=end_date,
                 proximity_limit=proximity_limit,
                 obi_cutoff=obi_cutoff,
-                base_size=base_size
+                base_size=base_size,
+                start_balance=start_balance
             )
             return backtester.run()
         except Exception as e:

@@ -7,12 +7,13 @@ import ssl
 from datetime import datetime, timezone, timedelta
 
 class Backtester:
-    def __init__(self, start_date=None, end_date=None, proximity_limit=0.0002, obi_cutoff=0.65, base_size=10.0):
+    def __init__(self, start_date=None, end_date=None, proximity_limit=0.0002, obi_cutoff=0.65, base_size=10.0, start_balance=1000.0):
         self.start_date = start_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self.end_date = end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self.proximity_limit = float(proximity_limit)
         self.obi_cutoff = float(obi_cutoff)
         self.base_size = float(base_size)
+        self.start_balance = float(start_balance)
         self.symbols = ["BTC", "ETH", "SOL", "XRP", "BNB"]
 
     def fetch_binance_klines(self, symbol, start_ms, end_ms, limit=1000):
@@ -71,7 +72,7 @@ class Backtester:
     def run(self):
         """Runs the historical strategy backtest simulation."""
         results = []
-        equity = 1000.0  # Simulated initial wallet
+        equity = self.start_balance  # Simulated initial wallet from user input
         initial_equity = equity
         max_equity = equity
         max_drawdown = 0.0
@@ -201,24 +202,36 @@ class Backtester:
                         logs.append(f"[ERROR] Data mapping corruption detected for {sym} Rd {total_rounds}. Forcing cache flush.")
                     continue
                 
-                # Calculate OBI momentum
-                base_obi = ((spot_at_close - strike) / strike) * 1000.0
+                # Calculate OBI momentum representing final 5s spot price velocity
+                base_obi = ((spot_at_close - spot_at_5s) / spot_at_5s) * 10000.0
                 base_obi = max(-0.95, min(0.95, base_obi))
                 obi = base_obi + random.uniform(-0.1, 0.1)
+                
+                # Model YES/NO contract prices to verify penny fill feasibility (must be <= $0.05)
+                delta = spot_at_5s - strike
+                volatility_factor = spot_at_5s * vol * 0.1 * 1.2
+                val = -delta / volatility_factor
+                price_yes = 1 / (1 + 2.718 ** max(-50.0, min(50.0, val)))
+                price_yes = max(0.01, min(0.99, price_yes))
+                price_no = 1.0 - price_yes
                 
                 is_win = False
                 traded = False
                 direction = ""
                 
-                # OBI directional evaluation
+                # OBI directional evaluation with feasibility check
                 if obi > 0.0:
-                    direction = "YES"
-                    is_win = (spot_at_close >= strike)
-                    traded = True
+                    # Direction = BUY_UP (YES). Bids only filled if the contract is cheap (price <= 0.05)
+                    if price_yes <= 0.05:
+                        direction = "YES"
+                        is_win = (spot_at_close >= strike)
+                        traded = True
                 elif obi < 0.0:
-                    direction = "NO"
-                    is_win = (spot_at_close < strike)
-                    traded = True
+                    # Direction = BUY_DOWN (NO). Bids only filled if the contract is cheap (price <= 0.05)
+                    if price_no <= 0.05:
+                        direction = "NO"
+                        is_win = (spot_at_close < strike)
+                        traded = True
                     
                 if traded:
                     # Simultaneous Tiered Price Ladder Slicing (3 limit orders)
@@ -249,7 +262,10 @@ class Backtester:
                         logs.append(f"[TRADE] Rd {total_rounds} {sym}: Tiered Bids Filled BUY {direction} @ Blended ${blended_price:.3f} -> {'WIN' if is_win else 'LOSS'} (PnL: {pnl:+.2f}). Wallet: ${equity+round_pnl:.2f}")
                 else:
                     if len(logs) < 200:
-                        logs.append(f"[BLOCKED] Rd {total_rounds} {sym}: OBI ({obi:.3f}) is exactly 0.0.")
+                        if obi == 0.0:
+                            logs.append(f"[BLOCKED] Rd {total_rounds} {sym}: OBI is exactly 0.0.")
+                        else:
+                            logs.append(f"[BLOCKED] Rd {total_rounds} {sym}: Bids not filled (Estimated YES/NO: ${price_yes:.2f}/${price_no:.2f}).")
 
             # Apply round results to simulated wallet balance
             equity += round_pnl
@@ -276,6 +292,7 @@ class Backtester:
             "gross_revenue": round(gross_revenue, 2),
             "net_profit": round(net_profit, 2),
             "max_drawdown_pct": round(max_drawdown, 2),
+            "start_balance": round(self.start_balance, 2),
             "equity_timeline": equity_timeline,
             "logs": logs
         }
