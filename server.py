@@ -704,6 +704,7 @@ class TradingEngine:
                                 "blocked_logged": False
                             }
                             self.add_system_log(f"Market Active: {slug_5m} | Strike Price Set: ${strike:,.2f}")
+                            asyncio.create_task(self.place_resting_orders_both_sides(self.active_markets[slug_5m]))
                         else:
                             self.add_system_log(f"[WARNING] Stale or misaligned contract details returned for {slug_5m}: asset={details_asset}, suffix={details_suffix}. Ignored.")
                     else:
@@ -722,6 +723,7 @@ class TradingEngine:
                             "resolved": False,
                             "blocked_logged": False
                         }
+                        asyncio.create_task(self.place_resting_orders_both_sides(self.active_markets[slug_5m]))
 
             # 2. Evaluate execution triggers (-5s to +2s window)
             for slug, market in list(self.active_markets.items()):
@@ -753,29 +755,8 @@ class TradingEngine:
                         self.active_markets.pop(slug)
                     continue
                 
-                # Strict boundary fence check: Time Delta <= 0.5 seconds
-                time_delta = float(market["close_time"]) - t_synced
-                fence_active = (time_delta <= 0.5)
-                
-                if fence_active:
-                    # Instantly kill state machine for this slug
-                    if slug in self.market_locks:
-                        self.market_locks.pop(slug)
-                    
-                    # Cancel any resting limits
-                    original_len = len(self.resting_limit_orders)
-                    self.resting_limit_orders = [o for o in self.resting_limit_orders if o["slug"] != slug]
-                    if len(self.resting_limit_orders) < original_len:
-                        self.add_system_log(f"[FENCE ACTIVE] Synced time delta = {time_delta:.3f}s <= 0.5s. Cancelled resting orders for {slug}.")
-                    
-                    # Update database LIMIT_POSTED to CANCELLED
-                    for trade in self.activity_log:
-                        if trade["slug"] == slug and trade["status"] == "LIMIT_POSTED":
-                            trade["status"] = "CANCELLED"
-                            trade["reason"] = "Failsafe active: Synced time delta expired before order fill"
-                            self.db.resolve_trade(trade["tx_hash"], "CANCELLED", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
-                
-                # Proximity checks completely removed per Order Book Shadowing pivot
+                # Resting orders are held passively in the book (never cancelled prior to expiration)
+                fence_active = False
                 
                 # Dynamic contract pricing estimation based on spot vs strike
                 # Difference between spot and strike
@@ -858,65 +839,8 @@ class TradingEngine:
                                     self.add_system_log(f"[MAKER LIMIT FILLED] Limit order for {order['outcome']} filled on {slug} @ ${order['price']:.3f}")
                                 self.resting_limit_orders.remove(order)
 
-                    # Evaluate execution triggers
-                    # timing window: final -1 seconds to +3 seconds epoch boundaries (handles ultra-fast execution threads right up to t-1s past interval closure)
-                    if -1 <= time_remaining <= 3 and market["last_evaluated"] != t:
-                        market["last_evaluated"] = t
-                        
-                        # OBI directional evaluation
-                        obi = self.live_obi.get(market["symbol"], 0.0)
-                        
-                        if obi != 0.0:
-                            direction = "Up" if obi > 0.0 else "Down"
-                            parent_order_id = f"parent-{slug}-{t}"
-                            
-                            # Fragment budget and blast concurrent limit orders via async gather
-                            num_slices = random.randint(3, 6)
-                            weights = [random.uniform(0.5, 1.5) for _ in range(num_slices)]
-                            total_weight = sum(weights)
-                            slices = [(w / total_weight) * self.max_position_size_usdc for w in weights]
-                            price_checkpoints = [0.010, 0.020, 0.030]
-                            
-                            tasks = []
-                            for i, slice_budget in enumerate(slices):
-                                price = price_checkpoints[i % len(price_checkpoints)]
-                                tasks.append(
-                                    self.post_maker_limit_order_async(
-                                        market, direction, price, "Strategy B (Penny Sweep)", slice_budget, parent_order_id=parent_order_id
-                                    )
-                                )
-                            # Await concurrent execution
-                            await asyncio.gather(*tasks)
-                        else:
-                            if not market.get("blocked_logged", False):
-                                tx_hash = f"0x{random.randbytes(32).hex()}"
-                                
-                                # Isolated Database Logging (Thread Isolation check)
-                                try:
-                                    self.db.insert_trade(
-                                        tx_hash,
-                                        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                                        slug,
-                                        "Strategy B (Penny Sweep)",
-                                        "Up",
-                                        0.0,
-                                        0.0,
-                                        self.priority_gas_gwei,
-                                        "BLOCKED",
-                                        execution_mode="MAKER_LIMIT",
-                                        strike_price=strike,
-                                        trigger_spot_price=spot,
-                                        time_delta_seconds=time_remaining,
-                                        block_reason="MOMENTUM_IMBALANCE_FAIL",
-                                        rejection_reason="MOMENTUM_IMBALANCE_FAIL",
-                                        spot_strike_delta=abs(spot - strike)
-                                    )
-                                except Exception as db_err:
-                                    self.add_system_log(f"[WARNING] Decoupled Database Logging Exception: {db_err}")
-                                    
-                                self.add_activity(slug, "Up/Down", 0.0, 0.0, "BLOCKED", tx_hash)
-                                self.add_system_log(f"[BLOCKED] {symbol}-5M BLOCKED: OBI ({obi:.3f}) is exactly 0.0")
-                                market["blocked_logged"] = True
+                    # Passive resting buy orders are managed on market registration
+                    pass
 
                 # 3. Post-Close Settlement Resolution (+2s grace period exploit)
                 # Polymarket oracle settlement delay allows scanning/executing for up to 2s post-close
@@ -981,6 +905,40 @@ class TradingEngine:
             
             await self.broadcast()
             await asyncio.sleep(1.0)
+
+    async def place_resting_orders_both_sides(self, market):
+        """Places passive resting maker limit buy orders on BOTH sides (Up and Down) simultaneously."""
+        slug = market["slug"]
+        parent_order_id_up = f"parent-up-{slug}"
+        parent_order_id_down = f"parent-down-{slug}"
+        
+        # Allocate budget: 10% for $0.03, 30% for $0.02, 60% for $0.01
+        levels = [
+            {"price": 0.030, "allocation": 0.10},
+            {"price": 0.020, "allocation": 0.30},
+            {"price": 0.010, "allocation": 0.60}
+        ]
+        
+        tasks = []
+        # Place Up orders
+        for level in levels:
+            budget = self.max_position_size_usdc * level["allocation"]
+            tasks.append(
+                self.post_maker_limit_order_async(
+                    market, "Up", level["price"], "Strategy B (Penny Sweep)", budget, parent_order_id=parent_order_id_up
+                )
+            )
+        # Place Down orders
+        for level in levels:
+            budget = self.max_position_size_usdc * level["allocation"]
+            tasks.append(
+                self.post_maker_limit_order_async(
+                    market, "Down", level["price"], "Strategy B (Penny Sweep)", budget, parent_order_id=parent_order_id_down
+                )
+            )
+            
+        # Broadcast all concurrent orders simultaneously
+        await asyncio.gather(*tasks)
 
     async def post_maker_limit_order_async(self, market, outcome, price, strategy_name, order_budget, parent_order_id=None):
         """Simulates placing an asynchronous resting maker limit order on the CLOB."""
