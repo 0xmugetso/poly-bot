@@ -718,20 +718,20 @@ export default function App() {
               <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider mb-1">State Engine Parameter Ledger</span>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-1.5 font-mono text-xs text-slate-400">
                 <div className="flex flex-col">
-                  <span className="text-[9px] text-slate-500 uppercase">Proximity Limit</span>
-                  <span className="text-slate-200 font-bold">0.02%</span>
+                  <span className="text-[9px] text-slate-500 uppercase">Pricing Ladder</span>
+                  <span className="text-slate-200 font-bold">$0.01 / $0.02 / $0.03</span>
                 </div>
                 <div className="flex flex-col">
-                  <span className="text-[9px] text-slate-500 uppercase">Sweep Gate</span>
-                  <span className="text-slate-200 font-bold">OBI &gt; 0.65</span>
+                  <span className="text-[9px] text-slate-500 uppercase">Budget Splitting</span>
+                  <span className="text-slate-200 font-bold">60% / 30% / 10%</span>
                 </div>
                 <div className="flex flex-col">
-                  <span className="text-[9px] text-slate-500 uppercase">Max Size</span>
-                  <span className="text-slate-200 font-bold">$0.10 USDC</span>
+                  <span className="text-[9px] text-slate-500 uppercase">Maker Mode</span>
+                  <span className="text-slate-200 font-bold">Two-Sided (Up & Down)</span>
                 </div>
                 <div className="flex flex-col">
-                  <span className="text-[9px] text-slate-500 uppercase">CLOB Time Limit</span>
-                  <span className="text-slate-200 font-bold">0.5s</span>
+                  <span className="text-[9px] text-slate-500 uppercase">Boundary Window</span>
+                  <span className="text-slate-200 font-bold">Sec 295-299 & 0-5</span>
                 </div>
               </div>
             </div>

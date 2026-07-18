@@ -18,20 +18,30 @@ class Backtester:
         self.symbols = ["BTC", "ETH", "SOL", "XRP"]
 
     def load_historical_ticks(self):
-        """Loads tick-by-tick L2 snapshots and trades from PMXT Dev / Telonex Parquet API, with offline fallback."""
+        """Loads tick-by-tick L2 snapshots and trades from PMXT Dev API, with offline fallback."""
         df = None
         try:
             import pandas as pd
             import urllib.request
             import io
             import ssl
+            import time
             url = f"https://api.pmxt.dev/v1/archive/ticks?api_key=pmxt_f06bc073593c55a8edbec8437c2136d2ddc7e501a1d7b5c6800f38a1e6aa8747&start_date={self.start_date}&end_date={self.end_date}"
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             ctx = ssl._create_unverified_context()
-            with urllib.request.urlopen(req, timeout=1, context=ctx) as response:
-                df = pd.read_parquet(io.BytesIO(response.read()))
-        except Exception:
-            pass
+            
+            for attempt in range(3):
+                try:
+                    with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
+                        df = pd.read_parquet(io.BytesIO(response.read()))
+                        break
+                except Exception as e:
+                    if "429" in str(e):
+                        time.sleep(2.0)
+                    else:
+                        raise e
+        except Exception as e:
+            print(f"[WARNING] PMXT API Ingestion failed: {e}. Falling back to offline candles reconstruction.")
             
         if df is not None:
             # Force strict chronological sort on data row ingestion
@@ -71,32 +81,29 @@ class Backtester:
                     strike = c["open"]
                     spot_at_close = c["close"]
                     
-                    vol = {"BTC": 0.0002, "ETH": 0.0003, "SOL": 0.0005, "XRP": 0.0008}.get(sym, 0.0003)
-                    
-                    # Generate deterministic tick values using md5 seeding to ban active clock randomness
-                    for step in range(4):
-                        sec_remaining = 3 - step
-                        tick_time = end_time_ms - (sec_remaining * 1000)
+                    # Generate deterministic tick values (linear interpolation, no randomness)
+                    # Spans from Second 295 to Second 305 of each 5m round block
+                    for sec in range(295, 306):
+                        tick_time = (c["time"] + sec) * 1000
                         
-                        weight = step / 3.0
-                        expected_spot = strike + (spot_at_close - strike) * weight
-                        
-                        seed_str = f"{tick_time}_{sym}_{strike}"
-                        import hashlib
-                        seed_hash = int(hashlib.md5(seed_str.encode('utf-8')).hexdigest(), 16) % (2**32)
-                        jitter = ((seed_hash % 2000) - 1000) / 1000.0 * (vol * 0.05)
-                        tick_spot = expected_spot * (1.0 + jitter)
-                        
-                        volatility_factor = strike * vol * 0.1 * 1.2
-                        delta = tick_spot - strike
-                        val = -delta / volatility_factor
-                        try:
-                            price_up = 1 / (1 + 2.718 ** max(-50.0, min(50.0, val)))
-                        except Exception:
-                            price_up = 0.5
-                        price_up = round(max(0.01, min(0.99, price_up)), 3)
-                        price_down = round(1.0 - price_up, 3)
-                        
+                        # Linear interpolation for spot price:
+                        if sec <= 300:
+                            weight = (sec - 295) / 5.0
+                            tick_spot = strike + (spot_at_close - strike) * weight
+                        else:
+                            tick_spot = spot_at_close
+                            
+                        # Deterministic outcome price:
+                        if tick_spot > strike:
+                            price_up = 0.99
+                            price_down = 0.01
+                        elif tick_spot < strike:
+                            price_up = 0.01
+                            price_down = 0.99
+                        else:
+                            price_up = 0.50
+                            price_down = 0.50
+                            
                         ticks.append({
                             "timestamp": tick_time,
                             "symbol": sym,
@@ -187,14 +194,14 @@ class Backtester:
                 continue
                 
             # Place mock limit orders directly in the L2 bid/ask depth matrices
-            # Since we maintain orders on BOTH sides (Up and Down outcomes) simultaneously:
-            up_l1_filled = any(t["price_up"] <= 0.030 for t in r["ticks"])
-            up_l2_filled = any(t["price_up"] <= 0.020 for t in r["ticks"])
-            up_l3_filled = any(t["price_up"] <= 0.010 for t in r["ticks"])
+            # Fills are logged 100% deterministically only when 1s tick physically crosses strike price
+            up_l1_filled = any(t["spot_price"] < strike for t in r["ticks"])
+            up_l2_filled = up_l1_filled
+            up_l3_filled = up_l1_filled
             
-            down_l1_filled = any(t["price_down"] <= 0.030 for t in r["ticks"])
-            down_l2_filled = any(t["price_down"] <= 0.020 for t in r["ticks"])
-            down_l3_filled = any(t["price_down"] <= 0.010 for t in r["ticks"])
+            down_l1_filled = any(t["spot_price"] > strike for t in r["ticks"])
+            down_l2_filled = down_l1_filled
+            down_l3_filled = down_l1_filled
             
             up_won = (spot_at_close >= strike)
             down_won = not up_won

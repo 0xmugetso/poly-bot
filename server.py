@@ -845,47 +845,8 @@ class TradingEngine:
                 # 3. Post-Close Settlement Resolution (+2s grace period exploit)
                 # Polymarket oracle settlement delay allows scanning/executing for up to 2s post-close
                 if time_remaining < -2:
-                    # Final spot tick resolution
-                    winner = "Up" if spot >= strike else "Down"
-                    
-                    # Resolve active simulated positions
-                    resolved_any = False
-                    for trade in self.activity_log:
-                        if trade["slug"] == slug and trade["status"] == "PENDING":
-                            resolved_any = True
-                            is_win = (trade["outcome"] == winner)
-                            if is_win:
-                                trade["status"] = "WIN"
-                                trade["reason"] = f"Target outcome resolved successfully: {trade['outcome']} won at close"
-                                self.wins += 1
-                                if "Arbitrage" in trade.get("strategy", ""):
-                                    self.arbitrage_wins += 1
-                                else:
-                                    self.penny_wins += 1
-                                payout = trade["size"]
-                                self.wallet += payout
-                                self.net_pnl_usdc += (payout - (trade["size"] * trade["price"]))
-                            else:
-                                trade["status"] = "LOSS"
-                                trade["reason"] = f"Target outcome expired worthless: opposite outcome won at close"
-                                self.losses += 1
-                                self.net_pnl_usdc -= (trade["size"] * trade["price"])
-                            
-                            self.resolved_trades_count += 1
-                            self.net_pnl_pct = (self.net_pnl_usdc / self.initial_wallet) * 100
-                            self.add_system_log(f"Round Settled: {slug} | Winner: {winner} | Trade: {trade['status']}")
-                            
-                            # Update database
-                            resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-                            self.db.resolve_trade(trade["tx_hash"], trade["status"], resolved_time)
-                    
-                    if resolved_any:
-                        self.add_system_log(f"Cleaned up resolved contract state for: {slug}")
-                        # Save daily stats
-                        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-                        win_rate = (self.wins / (self.wins + self.losses) * 100) if (self.wins + self.losses) > 0 else 0.0
-                        self.db.save_daily_stats(today_str, self.wallet, self.wins + self.losses, win_rate, now_str)
+                    # Trigger oracle polling and resolution in background
+                    asyncio.create_task(self.poll_and_resolve_market(slug, strike))
                     
                     # Clean up locks and limit orders
                     if slug in self.market_locks:
@@ -905,6 +866,125 @@ class TradingEngine:
             
             await self.broadcast()
             await asyncio.sleep(1.0)
+
+    async def resolve_market_via_oracle(self, slug):
+        """Queries Gamma API directly to retrieve the official settlement status and winner."""
+        try:
+            url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            ctx = ssl._create_unverified_context()
+            res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=5, context=ctx)
+            data = json.loads(res.read().decode())
+            if len(data) > 0:
+                m = data[0]
+                if m.get("closed") or m.get("active") is False:
+                    outcome_prices_str = m.get("outcomePrices")
+                    if outcome_prices_str:
+                        if isinstance(outcome_prices_str, str):
+                            prices = json.loads(outcome_prices_str)
+                        else:
+                            prices = outcome_prices_str
+                        
+                        if len(prices) >= 2:
+                            p_yes = float(prices[0])
+                            p_no = float(prices[1])
+                            if p_yes > 0.9 or p_no < 0.1:
+                                return "Up"
+                            elif p_no > 0.9 or p_yes < 0.1:
+                                return "Down"
+        except Exception as e:
+            self.add_system_log(f"[WARNING] Oracle resolution check failed for {slug}: {e}")
+        return None
+
+    async def poll_and_resolve_market(self, slug, strike):
+        """Asynchronously polls the Polymarket Gamma API until resolved, then settles trades."""
+        self.add_system_log(f"[ORACLE] Started settlement resolution polling task for: {slug}")
+        retry_delay = 1.0
+        max_retries = 300 # Poll for up to 5 minutes
+        
+        for attempt in range(max_retries):
+            winner = await self.resolve_market_via_oracle(slug)
+            if winner:
+                resolved_any = False
+                for trade in self.activity_log:
+                    if trade["slug"] == slug and trade["status"] == "PENDING":
+                        resolved_any = True
+                        is_win = (trade["outcome"] == winner)
+                        if is_win:
+                            trade["status"] = "WIN"
+                            trade["reason"] = f"Target outcome resolved successfully: {trade['outcome']} won at close"
+                            self.wins += 1
+                            if "Arbitrage" in trade.get("strategy", ""):
+                                self.arbitrage_wins += 1
+                            else:
+                                self.penny_wins += 1
+                            payout = trade["size"]
+                            self.wallet += payout
+                            self.net_pnl_usdc += (payout - (trade["size"] * trade["price"]))
+                        else:
+                            trade["status"] = "LOSS"
+                            trade["reason"] = f"Target outcome expired worthless: opposite outcome won at close"
+                            self.losses += 1
+                            self.net_pnl_usdc -= (trade["size"] * trade["price"])
+                        
+                        self.resolved_trades_count += 1
+                        self.net_pnl_pct = (self.net_pnl_usdc / self.initial_wallet) * 100
+                        self.add_system_log(f"[ORACLE] Round Settled: {slug} | Winner: {winner} | Trade: {trade['status']}")
+                        
+                        resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                        self.db.resolve_trade(trade["tx_hash"], trade["status"], resolved_time)
+                
+                if resolved_any:
+                    self.add_system_log(f"[ORACLE] Cleaned up resolved contract state for: {slug}")
+                    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                    win_rate = (self.wins / (self.wins + self.losses) * 100) if (self.wins + self.losses) > 0 else 0.0
+                    self.db.save_daily_stats(today_str, self.wallet, self.wins + self.losses, win_rate, now_str)
+                    await self.broadcast()
+                return
+                
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(5.0, retry_delay + 0.5)
+            
+        # Fallback local resolution
+        self.add_system_log(f"[ORACLE] Poll timeout for {slug}. Triggering local fallback resolution...")
+        symbol = slug.split("-")[0].upper()
+        spot = self.spot_prices.get(symbol, strike)
+        winner = "Up" if spot >= strike else "Down"
+        
+        resolved_any = False
+        for trade in self.activity_log:
+            if trade["slug"] == slug and trade["status"] == "PENDING":
+                resolved_any = True
+                is_win = (trade["outcome"] == winner)
+                if is_win:
+                    trade["status"] = "WIN"
+                    trade["reason"] = f"Fallback: outcome resolved: {trade['outcome']} won"
+                    self.wins += 1
+                    if "Arbitrage" in trade.get("strategy", ""):
+                        self.arbitrage_wins += 1
+                    else:
+                        self.penny_wins += 1
+                    payout = trade["size"]
+                    self.wallet += payout
+                    self.net_pnl_usdc += (payout - (trade["size"] * trade["price"]))
+                else:
+                    trade["status"] = "LOSS"
+                    trade["reason"] = f"Fallback: outcome expired: opposite won"
+                    self.losses += 1
+                    self.net_pnl_usdc -= (trade["size"] * trade["price"])
+                
+                self.resolved_trades_count += 1
+                self.net_pnl_pct = (self.net_pnl_usdc / self.initial_wallet) * 100
+                self.add_system_log(f"[ORACLE] Fallback Settled: {slug} | Winner: {winner} | Trade: {trade['status']}")
+                self.db.resolve_trade(trade["tx_hash"], trade["status"], datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+                
+        if resolved_any:
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            win_rate = (self.wins / (self.wins + self.losses) * 100) if (self.wins + self.losses) > 0 else 0.0
+            self.db.save_daily_stats(today_str, self.wallet, self.wins + self.losses, win_rate, now_str)
+            await self.broadcast()
 
     async def place_resting_orders_both_sides(self, market):
         """Places passive resting maker limit buy orders on BOTH sides (Up and Down) simultaneously."""
@@ -947,11 +1027,6 @@ class TradingEngine:
         # Simulate network latency of API request
         await asyncio.sleep(random.uniform(0.01, 0.05))
         
-        # Check MAX_SIMULTANEOUS_TRADES guardrail
-        active_pools = set(t["slug"] for t in self.activity_log if t["status"] in ["PENDING", "LIMIT_POSTED"])
-        for order in self.resting_limit_orders:
-            active_pools.add(order["slug"])
-            
         shares = order_budget / price
         priority_gas_gwei = self.priority_gas_gwei
         spot = self.live_prices.get(market["symbol"], 0.0)
@@ -962,30 +1037,6 @@ class TradingEngine:
             return
             
         time_delta = float(market["close_time"]) - (time.time() + self.clob_clock_offset)
-
-        if len(active_pools) >= self.max_simultaneous_trades and slug not in active_pools:
-            self.add_system_log(f"[Blocked] Maker limit order on {slug} blocked: Max simultaneous trades ({self.max_simultaneous_trades}) reached.")
-            
-            # Record blocked trade in database
-            tx_hash = f"0x{random.randbytes(32).hex()}"
-            self.db.insert_trade(
-                tx_hash,
-                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                slug,
-                strategy_name,
-                outcome,
-                price,
-                shares,
-                priority_gas_gwei,
-                "BLOCKED_BY_GUARDRAIL",
-                execution_mode="MAKER_LIMIT",
-                strike_price=strike,
-                trigger_spot_price=spot,
-                time_delta_seconds=time_delta,
-                block_reason="MAX_SIMULTANEOUS_TRADES",
-                parent_order_id=parent_order_id
-            )
-            return
 
         # Check gas-adjusted expected net profit to clear block inclusion
         gas_cost_usdc = 150000 * (priority_gas_gwei * 1e-9) * self.matic_price
@@ -1065,11 +1116,6 @@ class TradingEngine:
         """Simulates placing a resting maker limit order on the CLOB."""
         slug = market["slug"]
         
-        # Check MAX_SIMULTANEOUS_TRADES guardrail
-        active_pools = set(t["slug"] for t in self.activity_log if t["status"] in ["PENDING", "LIMIT_POSTED"])
-        for order in self.resting_limit_orders:
-            active_pools.add(order["slug"])
-            
         shares = (self.max_position_size_usdc * budget_allocation) / price
         priority_gas_gwei = self.priority_gas_gwei
         spot = self.live_prices.get(market["symbol"], 0.0)
@@ -1081,30 +1127,6 @@ class TradingEngine:
             return
             
         time_delta = float(market["close_time"]) - (time.time() + self.clob_clock_offset)
-
-        if len(active_pools) >= self.max_simultaneous_trades and slug not in active_pools:
-            self.add_system_log(f"[Blocked] Maker limit order on {slug} blocked: Max simultaneous trades ({self.max_simultaneous_trades}) reached.")
-            
-            # Record blocked trade in database
-            tx_hash = f"0x{random.randbytes(32).hex()}"
-            self.db.insert_trade(
-                tx_hash,
-                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                slug,
-                strategy_name,
-                outcome,
-                price,
-                shares,
-                priority_gas_gwei,
-                "BLOCKED_BY_GUARDRAIL",
-                execution_mode="MAKER_LIMIT",
-                strike_price=strike,
-                trigger_spot_price=spot,
-                time_delta_seconds=time_delta,
-                block_reason="MAX_SIMULTANEOUS_TRADES",
-                parent_order_id=parent_order_id
-            )
-            return
 
         # Check gas-adjusted expected net profit to clear block inclusion
         gas_cost_usdc = 150000 * (priority_gas_gwei * 1e-9) * self.matic_price
