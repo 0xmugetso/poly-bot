@@ -188,17 +188,12 @@ class Backtester:
                 strike = c["open"]
                 spot_at_close = c["close"]
                 
-                # Append close to rolling closes
-                rolling_closes[sym].append(spot_at_close)
-                if len(rolling_closes[sym]) > 6: # 30 minutes window (6 * 5m candles)
-                    rolling_closes[sym].pop(0)
-                
                 # Model the spot price 5 seconds before close (adding small tick volatility)
                 vols = {"BTC": 0.0002, "ETH": 0.0003, "SOL": 0.0005, "XRP": 0.0008, "BNB": 0.0003}
                 vol = vols.get(sym, 0.0003)
                 spot_at_5s = spot_at_close * (1 + random.normalvariate(0, vol * 0.1))
                 
-                # Hard Stop Pre-Flight Validation Rule
+                # Hard Stop Pre-Flight Validation Rule (remains as a basic safety check)
                 trigger_spot_price = spot_at_5s
                 strike_price = strike
                 if abs(trigger_spot_price - strike_price) / trigger_spot_price > 0.005:
@@ -206,126 +201,55 @@ class Backtester:
                         logs.append(f"[ERROR] Data mapping corruption detected for {sym} Rd {total_rounds}. Forcing cache flush.")
                     continue
                 
-                spot_strike_delta = abs(spot_at_5s - strike)
+                # Calculate OBI momentum
+                base_obi = ((spot_at_close - strike) / strike) * 1000.0
+                base_obi = max(-0.95, min(0.95, base_obi))
+                obi = base_obi + random.uniform(-0.1, 0.1)
                 
-                # Calculate rolling standard deviation of 5m closes
-                prices = rolling_closes[sym]
-                if len(prices) >= 2:
-                    mean = sum(prices) / len(prices)
-                    var = sum((x - mean) ** 2 for x in prices) / (len(prices) - 1)
-                    std = math.sqrt(var)
-                else:
-                    std = spot_at_5s * 0.0005 # default fallback
-                    
-                calculated_dynamic_limit = std * self.proximity_limit
+                is_win = False
+                traded = False
+                direction = ""
                 
-                # Define hard absolute minimum allowed distance floors per token type
-                FLOOR_LIMITS = {
-                    'BTC': 5.00,
-                    'ETH': 0.50,
-                    'SOL': 0.05,
-                    'XRP': 0.002,
-                    'BNB': 0.20
-                }
-                
-                asset_ticker = sym.upper()
-                final_allowed_limit = max(calculated_dynamic_limit, FLOOR_LIMITS.get(asset_ticker, 0.01))
-                
-                # Fallback to legacy static proximity limit
-                if final_allowed_limit == 0.0:
-                    final_allowed_limit = spot_at_5s * 0.0002
+                # OBI directional evaluation
+                if obi > 0.0:
+                    direction = "YES"
+                    is_win = (spot_at_close >= strike)
+                    traded = True
+                elif obi < 0.0:
+                    direction = "NO"
+                    is_win = (spot_at_close < strike)
+                    traded = True
                     
-                is_valid = (spot_strike_delta <= final_allowed_limit)
-                
-                if is_valid:
-                    # Model YES/NO prices
-                    delta = spot_at_5s - strike
-                    volatility_factor = 2.0 if sym in ["BTC", "BNB"] else 0.1
-                    val = -delta / volatility_factor
-                    # Apply sigmoid bounds
-                    price_yes = 1 / (1 + 2.718 ** max(-50.0, min(50.0, val)))
-                    price_yes = max(0.01, min(0.99, price_yes))
-                    price_no = 1 - price_yes
+                if traded:
+                    # Simultaneous Tiered Price Ladder Slicing (3 limit orders)
+                    total_executions += 3
                     
-                    # Calculate deterministic OBI based on open-to-close momentum
-                    base_obi = ((spot_at_close - strike) / strike) * 1000.0
-                    base_obi = max(-0.95, min(0.95, base_obi))
-                    obi = base_obi + random.uniform(-0.1, 0.1)
+                    l1_cost = 0.10 * self.base_size
+                    l2_cost = 0.30 * self.base_size
+                    l3_cost = 0.60 * self.base_size
                     
-                    yes_in_range = (0.01 <= price_yes <= 0.04)
-                    no_in_range = (0.01 <= price_no <= 0.04)
-                    traded = False
+                    l1_shares = l1_cost / 0.030
+                    l2_shares = l2_cost / 0.020
+                    l3_shares = l3_cost / 0.010
                     
-                    # Evaluate Strategy B gates
-                    if yes_in_range and obi > self.obi_cutoff:
-                        # Simultaneous Tiered Price Ladder Slicing (3 limit orders)
-                        total_executions += 3
+                    total_cost = self.base_size
+                    total_shares = l1_shares + l2_shares + l3_shares
+                    blended_price = total_cost / total_shares
+                    
+                    pnl = (total_shares - total_cost) if is_win else -total_cost
+                    
+                    if is_win:
+                        wins += 1
+                        gross_revenue += total_shares
+                    else:
+                        losses += 1
                         
-                        is_win = (spot_at_close >= strike)
-                        
-                        # Level 1, 2, 3
-                        l1_cost = 0.10 * self.base_size
-                        l2_cost = 0.30 * self.base_size
-                        l3_cost = 0.60 * self.base_size
-                        
-                        l1_shares = l1_cost / 0.030
-                        l2_shares = l2_cost / 0.020
-                        l3_shares = l3_cost / 0.010
-                        
-                        total_cost = self.base_size
-                        total_shares = l1_shares + l2_shares + l3_shares
-                        blended_price = total_cost / total_shares
-                        
-                        pnl = (total_shares - total_cost) if is_win else -total_cost
-                        
-                        if is_win:
-                            wins += 1
-                            gross_revenue += total_shares
-                        else:
-                            losses += 1
-                            
-                        round_pnl += pnl
-                        traded = True
-                        if len(logs) < 200:
-                            logs.append(f"[TRADE] Rd {total_rounds} {sym}: Tiered Bids Filled BUY YES @ Blended ${blended_price:.3f} -> {'WIN' if is_win else 'LOSS'} (PnL: {pnl:+.2f}). Wallet: ${equity+round_pnl:.2f}")
-                            
-                    elif no_in_range and obi < -self.obi_cutoff:
-                        # Simultaneous Tiered Price Ladder Slicing (3 limit orders)
-                        total_executions += 3
-                        
-                        is_win = (spot_at_close < strike)
-                        
-                        # Level 1, 2, 3
-                        l1_cost = 0.10 * self.base_size
-                        l2_cost = 0.30 * self.base_size
-                        l3_cost = 0.60 * self.base_size
-                        
-                        l1_shares = l1_cost / 0.030
-                        l2_shares = l2_cost / 0.020
-                        l3_shares = l3_cost / 0.010
-                        
-                        total_cost = self.base_size
-                        total_shares = l1_shares + l2_shares + l3_shares
-                        blended_price = total_cost / total_shares
-                        
-                        pnl = (total_shares - total_cost) if is_win else -total_cost
-                        
-                        if is_win:
-                            wins += 1
-                            gross_revenue += total_shares
-                        else:
-                            losses += 1
-                            
-                        round_pnl += pnl
-                        traded = True
-                        if len(logs) < 200:
-                            logs.append(f"[TRADE] Rd {total_rounds} {sym}: Tiered Bids Filled BUY NO @ Blended ${blended_price:.3f} -> {'WIN' if is_win else 'LOSS'} (PnL: {pnl:+.2f}). Wallet: ${equity+round_pnl:.2f}")
-                            
-                    if not traded and (yes_in_range or no_in_range) and len(logs) < 200:
-                        logs.append(f"[BLOCKED] Rd {total_rounds} {sym}: OBI ({obi:.3f}) momentum insufficient (YES/NO Ask: ${price_yes:.2f}/${price_no:.2f}).")
+                    round_pnl += pnl
+                    if len(logs) < 200:
+                        logs.append(f"[TRADE] Rd {total_rounds} {sym}: Tiered Bids Filled BUY {direction} @ Blended ${blended_price:.3f} -> {'WIN' if is_win else 'LOSS'} (PnL: {pnl:+.2f}). Wallet: ${equity+round_pnl:.2f}")
                 else:
                     if len(logs) < 200:
-                        logs.append(f"[BLOCKED] Rd {total_rounds} {sym}: Proximity delta (${spot_strike_delta:.2f}) exceeded limit.")
+                        logs.append(f"[BLOCKED] Rd {total_rounds} {sym}: OBI ({obi:.3f}) is exactly 0.0.")
 
             # Apply round results to simulated wallet balance
             equity += round_pnl

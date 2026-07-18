@@ -759,61 +759,7 @@ class TradingEngine:
                             trade["status"] = "CANCELLED"
                             self.db.resolve_trade(trade["tx_hash"], "CANCELLED", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
                 
-                # Volatility-Scaled Dynamic Proximity Threshold Check at t = 5s before close
-                if time_remaining <= 5 and "proximity_enabled" not in market:
-                    prices = self.rolling_prices.get(symbol, [])
-                    std = self.calculate_std(prices)
-                    
-                    calculated_dynamic_limit = std * self.volatility_coefficient
-                    
-                    # Define hard absolute minimum allowed distance floors per token type
-                    FLOOR_LIMITS = {
-                        'BTC': 5.00,
-                        'ETH': 0.50,
-                        'SOL': 0.05,
-                        'XRP': 0.002,
-                        'BNB': 0.20
-                    }
-                    
-                    asset_ticker = symbol.upper()
-                    final_allowed_limit = max(calculated_dynamic_limit, FLOOR_LIMITS.get(asset_ticker, 0.01))
-                    
-                    # Operational Live Check: fallback to legacy static proximity limit
-                    if final_allowed_limit == 0.0:
-                        final_allowed_limit = spot * 0.0002
-                        
-                    spot_strike_delta = abs(spot - strike)
-                    
-                    is_valid = (spot_strike_delta <= final_allowed_limit)
-                    market["proximity_enabled"] = is_valid
-                    
-                    if not is_valid:
-                        self.add_system_log(f"[Blocked] Proximity check for {slug}: Price Delta = ${spot_strike_delta:.3f} (Limit: ${final_allowed_limit:.3f}, Std: {std:.3f})")
-                        if not market.get("blocked_logged", False):
-                            tx_hash = f"0x{random.randbytes(32).hex()}"
-                            self.db.insert_trade(
-                                tx_hash,
-                                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                                slug,
-                                "Strategy B (Penny Sweep)",
-                                "Up",
-                                0.0,
-                                0.0,
-                                self.priority_gas_gwei,
-                                "BLOCKED",
-                                execution_mode="MAKER_LIMIT",
-                                strike_price=strike,
-                                trigger_spot_price=spot,
-                                time_delta_seconds=time_remaining,
-                                block_reason="PRICE_PROXIMITY_FAIL",
-                                rejection_reason="PRICE_PROXIMITY_FAIL",
-                                spot_strike_delta=spot_strike_delta
-                            )
-                            self.add_activity(slug, "Up/Down", 0.0, 0.0, "BLOCKED", tx_hash)
-                            self.add_system_log(f"[BLOCKED] {symbol}-5M BLOCKED: Price Delta (${spot_strike_delta:.3f}) exceeded dynamic limit (${final_allowed_limit:.3f})")
-                            market["blocked_logged"] = True
-                    else:
-                        self.add_system_log(f"[ENABLED] Proximity check for {slug}: Price Delta = ${spot_strike_delta:.3f} (Limit: ${final_allowed_limit:.3f}, Std: {std:.3f})")
+                # Proximity checks completely removed per Order Book Shadowing pivot
                 
                 # Dynamic contract pricing estimation based on spot vs strike
                 # Difference between spot and strike
@@ -900,51 +846,30 @@ class TradingEngine:
                     if -1 <= time_remaining <= 3 and market["last_evaluated"] != t:
                         market["last_evaluated"] = t
                         
-                        # We evaluate YES/NO only for Strategy B (Penny Sweeps) targeting $0.01 to $0.04
+                        # OBI directional evaluation
+                        obi = self.live_obi.get(market["symbol"], 0.0)
                         
-                        # Check YES (Up)
-                        yes_in_range = (0.01 <= price_yes <= 0.04)
-                        no_in_range = (0.01 <= price_no <= 0.04)
-                        
-                        yes_triggered = False
-                        no_triggered = False
-                        
-                        if market.get("proximity_enabled", True):
-                            obi = self.live_obi.get(market["symbol"], 0.0)
+                        if obi != 0.0:
+                            direction = "Up" if obi > 0.0 else "Down"
                             parent_order_id = f"parent-{slug}-{t}"
                             
-                            if yes_in_range:
-                                if obi > 0.65:
-                                    # Broadcast Tiered Price Ladder Slicing simultaneously
-                                    self.post_maker_limit_order(market, "Up", 0.030, "Strategy B (Penny Sweep)", budget_allocation=0.10, parent_order_id=parent_order_id)
-                                    self.post_maker_limit_order(market, "Up", 0.020, "Strategy B (Penny Sweep)", budget_allocation=0.30, parent_order_id=parent_order_id)
-                                    self.post_maker_limit_order(market, "Up", 0.010, "Strategy B (Penny Sweep)", budget_allocation=0.60, parent_order_id=parent_order_id)
-                                    yes_triggered = True
-                                else:
-                                    self.add_system_log(f"[Blocked] Up trigger skipped on {slug}: OBI ({obi:.3f}) <= 0.65")
-                                    
-                            if no_in_range:
-                                if obi < -0.65:
-                                    # Broadcast Tiered Price Ladder Slicing simultaneously
-                                    self.post_maker_limit_order(market, "Down", 0.030, "Strategy B (Penny Sweep)", budget_allocation=0.10, parent_order_id=parent_order_id)
-                                    self.post_maker_limit_order(market, "Down", 0.020, "Strategy B (Penny Sweep)", budget_allocation=0.30, parent_order_id=parent_order_id)
-                                    self.post_maker_limit_order(market, "Down", 0.010, "Strategy B (Penny Sweep)", budget_allocation=0.60, parent_order_id=parent_order_id)
-                                    no_triggered = True
-                                else:
-                                    self.add_system_log(f"[Blocked] Down trigger skipped on {slug}: OBI ({obi:.3f}) >= -0.65")
-                                    
-                            # Log block once per round if in range but OBI did not match
-                            if (yes_in_range and not yes_triggered) or (no_in_range and not no_triggered):
-                                if not market.get("blocked_logged", False):
-                                    spot_strike_delta = abs(spot - strike)
-                                    tx_hash = f"0x{random.randbytes(32).hex()}"
+                            # Immediately broadcast three concurrent resting Maker Limit orders simultaneously (absolute priority placement)
+                            self.post_maker_limit_order(market, direction, 0.030, "Strategy B (Penny Sweep)", budget_allocation=0.10, parent_order_id=parent_order_id)
+                            self.post_maker_limit_order(market, direction, 0.020, "Strategy B (Penny Sweep)", budget_allocation=0.30, parent_order_id=parent_order_id)
+                            self.post_maker_limit_order(market, direction, 0.010, "Strategy B (Penny Sweep)", budget_allocation=0.60, parent_order_id=parent_order_id)
+                        else:
+                            if not market.get("blocked_logged", False):
+                                tx_hash = f"0x{random.randbytes(32).hex()}"
+                                
+                                # Isolated Database Logging (Thread Isolation check)
+                                try:
                                     self.db.insert_trade(
                                         tx_hash,
                                         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                                         slug,
                                         "Strategy B (Penny Sweep)",
-                                        "Up" if yes_in_range else "Down",
-                                        price_yes if yes_in_range else price_no,
+                                        "Up",
+                                        0.0,
                                         0.0,
                                         self.priority_gas_gwei,
                                         "BLOCKED",
@@ -954,11 +879,14 @@ class TradingEngine:
                                         time_delta_seconds=time_remaining,
                                         block_reason="MOMENTUM_IMBALANCE_FAIL",
                                         rejection_reason="MOMENTUM_IMBALANCE_FAIL",
-                                        spot_strike_delta=spot_strike_delta
+                                        spot_strike_delta=abs(spot - strike)
                                     )
-                                    self.add_activity(slug, "Up" if yes_in_range else "Down", 0.0, 0.0, "BLOCKED", tx_hash)
-                                    self.add_system_log(f"[BLOCKED] {symbol}-5M BLOCKED: OBI ({obi:.3f}) momentum insufficient")
-                                    market["blocked_logged"] = True
+                                except Exception as db_err:
+                                    self.add_system_log(f"[WARNING] Decoupled Database Logging Exception: {db_err}")
+                                    
+                                self.add_activity(slug, "Up/Down", 0.0, 0.0, "BLOCKED", tx_hash)
+                                self.add_system_log(f"[BLOCKED] {symbol}-5M BLOCKED: OBI ({obi:.3f}) is exactly 0.0")
+                                market["blocked_logged"] = True
 
                 # 3. Post-Close Settlement Resolution (+2s grace period exploit)
                 # Polymarket oracle settlement delay allows scanning/executing for up to 2s post-close
