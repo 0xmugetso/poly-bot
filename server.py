@@ -870,10 +870,23 @@ class TradingEngine:
                             direction = "Up" if obi > 0.0 else "Down"
                             parent_order_id = f"parent-{slug}-{t}"
                             
-                            # Immediately broadcast three concurrent resting Maker Limit orders simultaneously (absolute priority placement)
-                            self.post_maker_limit_order(market, direction, 0.030, "Strategy B (Penny Sweep)", budget_allocation=0.10, parent_order_id=parent_order_id)
-                            self.post_maker_limit_order(market, direction, 0.020, "Strategy B (Penny Sweep)", budget_allocation=0.30, parent_order_id=parent_order_id)
-                            self.post_maker_limit_order(market, direction, 0.010, "Strategy B (Penny Sweep)", budget_allocation=0.60, parent_order_id=parent_order_id)
+                            # Fragment budget and blast concurrent limit orders via async gather
+                            num_slices = random.randint(3, 6)
+                            weights = [random.uniform(0.5, 1.5) for _ in range(num_slices)]
+                            total_weight = sum(weights)
+                            slices = [(w / total_weight) * self.max_position_size_usdc for w in weights]
+                            price_checkpoints = [0.010, 0.020, 0.030]
+                            
+                            tasks = []
+                            for i, slice_budget in enumerate(slices):
+                                price = price_checkpoints[i % len(price_checkpoints)]
+                                tasks.append(
+                                    self.post_maker_limit_order_async(
+                                        market, direction, price, "Strategy B (Penny Sweep)", slice_budget, parent_order_id=parent_order_id
+                                    )
+                                )
+                            # Await concurrent execution
+                            await asyncio.gather(*tasks)
                         else:
                             if not market.get("blocked_logged", False):
                                 tx_hash = f"0x{random.randbytes(32).hex()}"
@@ -968,6 +981,127 @@ class TradingEngine:
             
             await self.broadcast()
             await asyncio.sleep(1.0)
+
+    async def post_maker_limit_order_async(self, market, outcome, price, strategy_name, order_budget, parent_order_id=None):
+        """Simulates placing an asynchronous resting maker limit order on the CLOB."""
+        slug = market["slug"]
+        
+        # Simulate network latency of API request
+        await asyncio.sleep(random.uniform(0.01, 0.05))
+        
+        # Check MAX_SIMULTANEOUS_TRADES guardrail
+        active_pools = set(t["slug"] for t in self.activity_log if t["status"] in ["PENDING", "LIMIT_POSTED"])
+        for order in self.resting_limit_orders:
+            active_pools.add(order["slug"])
+            
+        shares = order_budget / price
+        priority_gas_gwei = self.priority_gas_gwei
+        spot = self.live_prices.get(market["symbol"], 0.0)
+        strike = market.get("strike_price", 0.0)
+        
+        if strike <= 0.0 or spot <= 0.0:
+            self.add_system_log(f"[WARNING] Aborting trade on {slug}: Strike or Spot price read failed (defaulted to 0.0)")
+            return
+            
+        time_delta = float(market["close_time"]) - (time.time() + self.clob_clock_offset)
+
+        if len(active_pools) >= self.max_simultaneous_trades and slug not in active_pools:
+            self.add_system_log(f"[Blocked] Maker limit order on {slug} blocked: Max simultaneous trades ({self.max_simultaneous_trades}) reached.")
+            
+            # Record blocked trade in database
+            tx_hash = f"0x{random.randbytes(32).hex()}"
+            self.db.insert_trade(
+                tx_hash,
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                slug,
+                strategy_name,
+                outcome,
+                price,
+                shares,
+                priority_gas_gwei,
+                "BLOCKED_BY_GUARDRAIL",
+                execution_mode="MAKER_LIMIT",
+                strike_price=strike,
+                trigger_spot_price=spot,
+                time_delta_seconds=time_delta,
+                block_reason="MAX_SIMULTANEOUS_TRADES",
+                parent_order_id=parent_order_id
+            )
+            return
+
+        # Check gas-adjusted expected net profit to clear block inclusion
+        gas_cost_usdc = 150000 * (priority_gas_gwei * 1e-9) * self.matic_price
+        expected_net_profit = (shares * (1.00 - price)) - gas_cost_usdc
+        
+        if expected_net_profit <= self.min_profit_threshold_usdc:
+            self.add_system_log(f"[Blocked] Maker limit order on {slug} blocked: Expected net profit ({expected_net_profit:.4f}) <= threshold ({self.min_profit_threshold_usdc}).")
+            
+            # Record blocked trade in database
+            tx_hash = f"0x{random.randbytes(32).hex()}"
+            self.db.insert_trade(
+                tx_hash,
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                slug,
+                strategy_name,
+                outcome,
+                price,
+                shares,
+                priority_gas_gwei,
+                "BLOCKED_BY_GUARDRAIL",
+                execution_mode="MAKER_LIMIT",
+                strike_price=strike,
+                trigger_spot_price=spot,
+                time_delta_seconds=time_delta,
+                block_reason="GAS_UNPROFITABLE",
+                parent_order_id=parent_order_id
+            )
+            return
+
+        # Post resting limit order
+        tx_hash = f"0x{random.randbytes(32).hex()}"
+        self.resting_limit_orders.append({
+            "slug": slug,
+            "outcome": outcome,
+            "price": price,
+            "size": shares,
+            "strategy": strategy_name,
+            "tx_hash": tx_hash,
+            "strike_price": strike,
+            "trigger_spot_price": spot,
+            "time_delta_seconds": time_delta,
+            "parent_order_id": parent_order_id
+        })
+        
+        # Record trade as LIMIT_POSTED
+        trade = self.add_activity(
+            slug, 
+            outcome, 
+            price, 
+            shares, 
+            "LIMIT_POSTED", 
+            tx_hash,
+            reason=f"Maker Limit Order fragment posted to orderbook (Size: {shares:.1f} shares @ ${price:.3f})"
+        )
+        trade["strategy"] = strategy_name
+        trade["parent_order_id"] = parent_order_id
+        
+        self.db.insert_trade(
+            tx_hash,
+            trade["datetime_utc"],
+            slug,
+            strategy_name,
+            outcome,
+            price,
+            shares,
+            priority_gas_gwei,
+            "LIMIT_POSTED",
+            execution_mode="MAKER_LIMIT",
+            strike_price=strike,
+            trigger_spot_price=spot,
+            time_delta_seconds=time_delta,
+            parent_order_id=parent_order_id
+        )
+        self.add_system_log(f"[LIMIT_POSTED] Posted async maker limit order on {slug}: {shares:.1f} shares of {outcome} @ ${price:.3f} (parent: {parent_order_id})")
 
     def post_maker_limit_order(self, market, outcome, price, strategy_name, budget_allocation=1.0, parent_order_id=None):
         """Simulates placing a resting maker limit order on the CLOB."""
