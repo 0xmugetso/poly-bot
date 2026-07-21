@@ -262,7 +262,6 @@ class TradingEngine:
         # Configuration
         self.max_slippage = 0.01
         self.max_position_size_usdc = float(os.environ.get("MAX_POSITION_SIZE_USDC", 0.10))
-        self.max_simultaneous_trades = int(os.environ.get("MAX_SIMULTANEOUS_TRADES", 2))
         self.min_profit_threshold_usdc = float(os.environ.get("MIN_PROFIT_THRESHOLD_USDC", 0.02))
         self.env = os.environ.get("ENV", "SIMULATION")
         
@@ -461,6 +460,7 @@ class TradingEngine:
     async def binance_price_feed(self):
         """Streams orderbook depth from Binance Spot WebSocket, calculates OBI, and derives mid-prices.
         Exhibits self-healing properties: falls back to Binance.US if the host is geoblocked (HTTP 451).
+        Uses exponential backoff starting at 100ms (max 5s) for instant reconnects.
         """
         pairs = ["btcusdt", "ethusdt", "solusdt", "xrpusdt", "bnbusdt"]
         streams_param = "/".join(f"{p}@depth10@100ms" for p in pairs)
@@ -469,6 +469,7 @@ class TradingEngine:
         us_url = f"wss://stream.binance.us:9443/stream?streams={streams_param}"
         
         use_us_feed = False
+        retry_delay = 0.1
         
         while True:
             url = us_url if use_us_feed else global_url
@@ -477,6 +478,7 @@ class TradingEngine:
                 ssl_context = ssl._create_unverified_context()
                 async with websockets.connect(url, ssl=ssl_context) as ws:
                     self.add_system_log(f"Subscribed to {'Binance.US' if use_us_feed else 'Binance Global'} 10-level @ 100ms partial book depth streams.")
+                    retry_delay = 0.1 # Reset on successful connection
                     
                     while True:
                         try:
@@ -517,9 +519,11 @@ class TradingEngine:
                 if "451" in err_str and not use_us_feed:
                     self.add_system_log("HTTP 451 detected (Geo-blocked). Switching to Binance.US feed...")
                     use_us_feed = True
+                    retry_delay = 0.1
                 else:
-                    self.add_system_log("Reconnecting in 1s...")
-                    await asyncio.sleep(1)
+                    self.add_system_log(f"Reconnecting in {retry_delay:.2f}s...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(5.0, retry_delay * 2.0)
 
     def calculate_std(self, prices):
         if len(prices) < 2:
@@ -845,20 +849,47 @@ class TradingEngine:
                 # 3. Post-Close Settlement Resolution (+2s grace period exploit)
                 # Polymarket oracle settlement delay allows scanning/executing for up to 2s post-close
                 if time_remaining < -2:
-                    # Trigger oracle polling and resolution in background
-                    asyncio.create_task(self.poll_and_resolve_market(slug, strike))
-                    
-                    # Clean up locks and limit orders
+                    # Clean up locks
                     if slug in self.market_locks:
                         self.market_locks.pop(slug)
-                    self.resting_limit_orders = [o for o in self.resting_limit_orders if o["slug"] != slug]
+                        
+                    # Query Polymarket CLOB status first for each resting order before epoch turnover
+                    condition_id = market.get("conditionId")
                     
-                    # Also update any remaining LIMIT_POSTED trades to CANCELLED in database and activity log
-                    for trade in self.activity_log:
-                        if trade["slug"] == slug and trade["status"] == "LIMIT_POSTED":
-                            trade["status"] = "CANCELLED"
-                            trade["reason"] = "Failsafe active: Order cancelled before expiry"
-                            self.db.resolve_trade(trade["tx_hash"], "CANCELLED", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+                    # Create copy of resting limit orders to safely iterate and modify
+                    for order in list(self.resting_limit_orders):
+                        if order["slug"] == slug:
+                            # Query status of order from Polymarket CLOB
+                            order_status = await self.get_clob_order_status(order["tx_hash"])
+                            
+                            if order_status in ["FILLED", "PARTIALLY_FILLED"]:
+                                # Transition it to PENDING (for Oracle worker settlement)
+                                matched_trade = None
+                                for trade in self.activity_log:
+                                    if trade["tx_hash"] == order["tx_hash"]:
+                                        matched_trade = trade
+                                        break
+                                        
+                                if matched_trade and matched_trade["status"] == "LIMIT_POSTED":
+                                    matched_trade["status"] = "PENDING"
+                                    matched_trade["reason"] = "Resting limit order filled before close (determined via CLOB query)"
+                                    self.db.resolve_trade(order["tx_hash"], "PENDING", None)
+                                    
+                                if order in self.resting_limit_orders:
+                                    self.resting_limit_orders.remove(order)
+                            else:
+                                # strictly UNFILLED -> Cancel order
+                                if order in self.resting_limit_orders:
+                                    self.resting_limit_orders.remove(order)
+                                    
+                                for trade in self.activity_log:
+                                    if trade["tx_hash"] == order["tx_hash"] and trade["status"] == "LIMIT_POSTED":
+                                        trade["status"] = "CANCELLED"
+                                        trade["reason"] = "Failsafe active: Order unfilled at close, cancelled"
+                                        self.db.resolve_trade(order["tx_hash"], "CANCELLED", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+                    
+                    # Trigger oracle polling and resolution in background
+                    asyncio.create_task(self.poll_and_resolve_market(slug, strike, condition_id))
                     
                     # Remove from active listing
                     market["resolved"] = True
@@ -867,10 +898,31 @@ class TradingEngine:
             await self.broadcast()
             await asyncio.sleep(1.0)
 
-    async def resolve_market_via_oracle(self, slug):
+    async def get_clob_order_status(self, order_id):
+        """Queries the Polymarket CLOB GET /order/{order_id} endpoint for status."""
+        try:
+            url = f"https://clob.polymarket.com/order/{order_id}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            ctx = ssl._create_unverified_context()
+            res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=5, context=ctx)
+            data = json.loads(res.read().decode())
+            return data.get("status") # e.g. "FILLED", "PARTIALLY_FILLED", "UNFILLED"
+        except Exception:
+            # Fallback check for simulated/dry-run orders
+            for trade in self.activity_log:
+                if trade["tx_hash"] == order_id:
+                    if trade["status"] in ["PENDING", "WIN", "LOSS"]:
+                        return "FILLED"
+            return "UNFILLED"
+
+    async def resolve_market_via_oracle(self, slug, condition_id=None):
         """Queries Gamma API directly to retrieve the official settlement status and winner."""
         try:
-            url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+            if condition_id and not condition_id.startswith("cond-"):
+                url = f"https://gamma-api.polymarket.com/markets?conditionId={condition_id}&closed=true"
+            else:
+                url = f"https://gamma-api.polymarket.com/markets?slug={slug}&closed=true"
+                
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             ctx = ssl._create_unverified_context()
             res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=5, context=ctx)
@@ -893,17 +945,16 @@ class TradingEngine:
                             elif p_no > 0.9 or p_yes < 0.1:
                                 return "Down"
         except Exception as e:
-            self.add_system_log(f"[WARNING] Oracle resolution check failed for {slug}: {e}")
+            self.add_system_log(f"[WARNING] Oracle resolution check failed for {slug} (conditionId: {condition_id}): {e}")
         return None
 
-    async def poll_and_resolve_market(self, slug, strike):
+    async def poll_and_resolve_market(self, slug, strike, condition_id=None):
         """Asynchronously polls the Polymarket Gamma API until resolved, then settles trades."""
-        self.add_system_log(f"[ORACLE] Started settlement resolution polling task for: {slug}")
+        self.add_system_log(f"[ORACLE] Started settlement resolution polling task for: {slug} (conditionId: {condition_id})")
         retry_delay = 1.0
-        max_retries = 300 # Poll for up to 5 minutes
         
-        for attempt in range(max_retries):
-            winner = await self.resolve_market_via_oracle(slug)
+        while True:
+            winner = await self.resolve_market_via_oracle(slug, condition_id)
             if winner:
                 resolved_any = False
                 for trade in self.activity_log:
@@ -944,47 +995,7 @@ class TradingEngine:
                 return
                 
             await asyncio.sleep(retry_delay)
-            retry_delay = min(5.0, retry_delay + 0.5)
-            
-        # Fallback local resolution
-        self.add_system_log(f"[ORACLE] Poll timeout for {slug}. Triggering local fallback resolution...")
-        symbol = slug.split("-")[0].upper()
-        spot = self.spot_prices.get(symbol, strike)
-        winner = "Up" if spot >= strike else "Down"
-        
-        resolved_any = False
-        for trade in self.activity_log:
-            if trade["slug"] == slug and trade["status"] == "PENDING":
-                resolved_any = True
-                is_win = (trade["outcome"] == winner)
-                if is_win:
-                    trade["status"] = "WIN"
-                    trade["reason"] = f"Fallback: outcome resolved: {trade['outcome']} won"
-                    self.wins += 1
-                    if "Arbitrage" in trade.get("strategy", ""):
-                        self.arbitrage_wins += 1
-                    else:
-                        self.penny_wins += 1
-                    payout = trade["size"]
-                    self.wallet += payout
-                    self.net_pnl_usdc += (payout - (trade["size"] * trade["price"]))
-                else:
-                    trade["status"] = "LOSS"
-                    trade["reason"] = f"Fallback: outcome expired: opposite won"
-                    self.losses += 1
-                    self.net_pnl_usdc -= (trade["size"] * trade["price"])
-                
-                self.resolved_trades_count += 1
-                self.net_pnl_pct = (self.net_pnl_usdc / self.initial_wallet) * 100
-                self.add_system_log(f"[ORACLE] Fallback Settled: {slug} | Winner: {winner} | Trade: {trade['status']}")
-                self.db.resolve_trade(trade["tx_hash"], trade["status"], datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
-                
-        if resolved_any:
-            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            win_rate = (self.wins / (self.wins + self.losses) * 100) if (self.wins + self.losses) > 0 else 0.0
-            self.db.save_daily_stats(today_str, self.wallet, self.wins + self.losses, win_rate, now_str)
-            await self.broadcast()
+            retry_delay = min(10.0, retry_delay + 1.0)
 
     async def place_resting_orders_both_sides(self, market):
         """Places passive resting maker limit buy orders on BOTH sides (Up and Down) simultaneously."""

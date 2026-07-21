@@ -4,7 +4,128 @@ import random
 import os
 import urllib.request
 import ssl
+import re
 from datetime import datetime, timezone, timedelta
+import pandas as pd
+
+class HTTPRangeFile:
+    def __init__(self, url, headers=None):
+        self.url = url
+        self.headers = headers or {}
+        self.position = 0
+        self.closed = False
+        
+        # Query headers first to get total file size
+        req = urllib.request.Request(url, headers=self.headers, method='HEAD')
+        ctx = ssl._create_unverified_context()
+        try:
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as res:
+                self.size = int(res.headers.get('Content-Length', 0))
+        except Exception:
+            self.size = 0
+            
+    def seek(self, offset, whence=0):
+        if whence == 0:
+            self.position = offset
+        elif whence == 1:
+            self.position += offset
+        elif whence == 2:
+            self.position = self.size + offset
+        return self.position
+        
+    def tell(self):
+        return self.position
+        
+    def read(self, size=-1):
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        if size == -1:
+            size = self.size - self.position
+        if size <= 0:
+            return b""
+            
+        end = self.position + size - 1
+        req = urllib.request.Request(self.url, headers=self.headers)
+        req.add_header('Range', f'bytes={self.position}-{end}')
+        ctx = ssl._create_unverified_context()
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as res:
+                data = res.read()
+                self.position += len(data)
+                return data
+        except Exception as e:
+            raise e
+            
+    def close(self):
+        self.closed = True
+
+def get_market_details_cached(slug):
+    cache_path = "market_details_cache.json"
+    cache = {}
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                cache = json.load(f)
+        except Exception:
+            pass
+            
+    if slug in cache:
+        return cache[slug]
+        
+    url = f"https://gamma-api.polymarket.com/markets?slug={slug}&closed=true"
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    ctx = ssl._create_unverified_context()
+    
+    # Retry loop with backoff for rate limiting
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as res:
+                data = json.loads(res.read().decode('utf-8'))
+                if data:
+                    m = data[0]
+                    
+                    # Parse clobTokenIds safely
+                    clob_raw = m.get("clobTokenIds")
+                    if isinstance(clob_raw, str):
+                        clob_tokens = json.loads(clob_raw)
+                    else:
+                        clob_tokens = clob_raw or []
+                        
+                    # Parse outcomes safely
+                    outcomes_raw = m.get("outcomes")
+                    if isinstance(outcomes_raw, str):
+                        outcomes = json.loads(outcomes_raw)
+                    else:
+                        outcomes = outcomes_raw or []
+                        
+                    # Parse outcomePrices safely
+                    prices_raw = m.get("outcomePrices")
+                    if isinstance(prices_raw, str):
+                        prices = json.loads(prices_raw)
+                    else:
+                        prices = prices_raw or []
+                        
+                    details = {
+                        "conditionId": m.get("conditionId"),
+                        "clobTokenIds": clob_tokens,
+                        "question": m.get("question"),
+                        "outcomes": outcomes,
+                        "outcomePrices": prices,
+                        "closed": m.get("closed"),
+                        "active": m.get("active")
+                    }
+                    cache[slug] = details
+                    with open(cache_path, "w") as f:
+                        json.dump(cache, f)
+                    return details
+                else:
+                    return None
+        except Exception as e:
+            if "429" in str(e):
+                time.sleep(2.0)
+            else:
+                break
+    return None
 
 class Backtester:
     def __init__(self, start_date=None, end_date=None, proximity_limit=0.0002, obi_cutoff=0.65, base_size=10.0, start_balance=1000.0, vol_multiplier=4.8):
@@ -17,133 +138,75 @@ class Backtester:
         self.vol_multiplier = float(vol_multiplier)
         self.symbols = ["BTC", "ETH", "SOL", "XRP"]
 
-    def load_historical_ticks(self):
-        """Loads tick-by-tick L2 snapshots and trades from PMXT Dev API, with offline fallback."""
-        df = None
-        try:
-            import pandas as pd
-            import urllib.request
-            import io
-            import ssl
-            import time
-            url = f"https://api.pmxt.dev/v1/archive/ticks?api_key=pmxt_f06bc073593c55a8edbec8437c2136d2ddc7e501a1d7b5c6800f38a1e6aa8747&start_date={self.start_date}&end_date={self.end_date}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            ctx = ssl._create_unverified_context()
-            
-            for attempt in range(3):
-                try:
-                    with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
-                        df = pd.read_parquet(io.BytesIO(response.read()))
-                        break
-                except Exception as e:
-                    if "429" in str(e):
-                        time.sleep(2.0)
-                    else:
-                        raise e
-        except Exception as e:
-            print(f"[WARNING] PMXT API Ingestion failed: {e}. Falling back to offline candles reconstruction.")
-            
-        if df is not None:
-            # Force strict chronological sort on data row ingestion
-            df = df.sort_values(by='timestamp')
-            return df.to_dict('records')
-            
-        # Offline fallback: load from historical_candles_2026.json and reconstruct high-fidelity tick-by-tick order book events
-        # chronologically sorted by timestamp. Ban any active system clock calls.
-        import json
-        local_path = "historical_candles_2026.json"
-        if not os.path.exists(local_path):
-            local_path = "/Users/khash/Projects/poly-bot/historical_candles_2026.json"
-            
-        try:
-            with open(local_path, "r") as f:
-                raw_data = json.load(f)
-        except Exception:
-            raw_data = {}
-            
-        ticks = []
-        if isinstance(raw_data, dict):
-            for sym, candles in raw_data.items():
-                if sym not in self.symbols:
-                    continue
-                for c in candles:
-                    # Date filter check
-                    try:
-                        candle_date = datetime.fromtimestamp(c["time"], tz=timezone.utc).strftime("%Y-%m-%d")
-                    except Exception:
-                        continue
-                        
-                    if candle_date < self.start_date or candle_date > self.end_date:
-                        continue
-                        
-                    # Reconstruct tick-by-tick L2 order book updates and trades chronologically for the final 5s window
-                    end_time_ms = (c["time"] + 300) * 1000
-                    strike = c["open"]
-                    spot_at_close = c["close"]
-                    
-                    # Generate deterministic tick values (linear interpolation, no randomness)
-                    # Spans from Second 295 to Second 305 of each 5m round block
-                    for sec in range(295, 306):
-                        tick_time = (c["time"] + sec) * 1000
-                        
-                        # Linear interpolation for spot price:
-                        if sec <= 300:
-                            weight = (sec - 295) / 5.0
-                            tick_spot = strike + (spot_at_close - strike) * weight
-                        else:
-                            tick_spot = spot_at_close
-                            
-                        # Deterministic outcome price:
-                        if tick_spot > strike:
-                            price_up = 0.99
-                            price_down = 0.01
-                        elif tick_spot < strike:
-                            price_up = 0.01
-                            price_down = 0.99
-                        else:
-                            price_up = 0.50
-                            price_down = 0.50
-                            
-                        ticks.append({
-                            "timestamp": tick_time,
-                            "symbol": sym,
-                            "strike_price": strike,
-                            "spot_price": tick_spot,
-                            "price_up": price_up,
-                            "price_down": price_down,
-                            "high": c["high"],
-                            "low": c["low"],
-                            "open": c["open"],
-                            "close": c["close"]
-                        })
-                        
-        ticks.sort(key=lambda x: x["timestamp"])
-        return ticks
-
     def run(self):
-        """Runs the historical strategy backtest simulation."""
         logs = []
-        logs.append("[SYSTEM] Initializing historical limit order book backtest engine...")
+        logs.append("[SYSTEM] Initializing Polymarket historical L2 backtest engine...")
         
-        # Load tick-by-tick data
-        ticks = self.load_historical_ticks()
-        logs.append(f"[DATA] Ingested and sorted {len(ticks)} tick-by-tick order book states.")
-        
-        # Group ticks by round: (symbol, open) representing round strike
-        rounds = {}
-        for tick in ticks:
-            round_key = (tick["symbol"], tick["open"])
-            if round_key not in rounds:
-                rounds[round_key] = {
-                    "symbol": tick["symbol"],
-                    "strike": tick["strike_price"],
-                    "close": tick["close"],
-                    "high": tick["high"],
-                    "low": tick["low"],
-                    "ticks": []
-                }
-            rounds[round_key]["ticks"].append(tick)
+        # Parse dates
+        try:
+            start_dt = datetime.strptime(self.start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            end_dt = datetime.strptime(self.end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+        except Exception as e:
+            return {"error": f"Invalid date format: {e}"}
             
+        logs.append(f"[SYSTEM] Backtesting period: {self.start_date} to {self.end_date}")
+        
+        # 1. Generate all 5-minute round close times in the date range
+        close_times = []
+        curr = int(start_dt.timestamp())
+        end_ts = int(end_dt.timestamp())
+        if curr % 300 != 0:
+            curr += (300 - (curr % 300))
+        while curr < end_ts:
+            close_times.append(curr)
+            curr += 300
+            
+        logs.append(f"[SYSTEM] Generated {len(close_times)} target 5-minute rounds.")
+        
+        # 2. Gather market details (conditionId, clobTokenIds) for all rounds and symbols
+        rounds_to_evaluate = []
+        logs.append("[SYSTEM] Querying Polymarket Gamma API metadata (with local cache)...")
+        
+        for t_close in close_times:
+            epoch_start = t_close - 300
+            for sym in self.symbols:
+                slug = f"{sym.lower()}-updown-5m-{epoch_start}"
+                details = get_market_details_cached(slug)
+                if details and details.get("conditionId") and len(details.get("clobTokenIds", [])) >= 2:
+                    rounds_to_evaluate.append({
+                        "slug": slug,
+                        "symbol": sym,
+                        "epoch_start": epoch_start,
+                        "epoch_close": t_close,
+                        "details": details
+                    })
+                    
+        logs.append(f"[SYSTEM] Found {len(rounds_to_evaluate)} valid Polymarket 5m rounds to evaluate.")
+        if not rounds_to_evaluate:
+            return {
+                "total_rounds": 0,
+                "total_executions": 0,
+                "win_rate": 0.0,
+                "gross_revenue": 0.0,
+                "net_profit": 0.0,
+                "max_drawdown_pct": 0.0,
+                "start_balance": round(self.start_balance, 2),
+                "unique_rounds_entered": 0,
+                "equity_timeline": [{"time": 0, "equity": self.start_balance}],
+                "logs": logs
+            }
+            
+        # Group rounds by the hour they close in
+        rounds_by_hour = {}
+        for r in rounds_to_evaluate:
+            dt = datetime.fromtimestamp(r["epoch_close"], tz=timezone.utc)
+            hour_str = dt.strftime("%Y-%m-%dT%H")
+            if hour_str not in rounds_by_hour:
+                rounds_by_hour[hour_str] = []
+            rounds_by_hour[hour_str].append(r)
+            
+        sorted_hours = sorted(rounds_by_hour.keys())
+        
         equity = self.start_balance
         max_equity = equity
         max_drawdown = 0.0
@@ -156,140 +219,166 @@ class Backtester:
         unique_rounds_entered = 0
         equity_timeline = [{"time": 0, "equity": equity}]
         
-        if not rounds:
-            return {
-                "total_rounds": 0,
-                "total_executions": 0,
-                "win_rate": 0.0,
-                "gross_revenue": 0.0,
-                "net_profit": 0.0,
-                "max_drawdown_pct": 0.0,
-                "start_balance": round(self.start_balance, 2),
-                "unique_rounds_entered": 0,
-                "equity_timeline": equity_timeline,
-                "logs": logs
-            }
-            
-        sorted_rounds = sorted(rounds.values(), key=lambda r: r["ticks"][0]["timestamp"])
-        
-        for r in sorted_rounds:
-            # Strict Capital Liquidation Check
-            if equity < self.base_size:
-                logs.append(f"[LIQUIDATED] Simulation halted at round {total_rounds}. Account balance (${equity:.2f}) dropped below required position size (${self.base_size:.1f}).")
-                break
+        # 3. Process hour-by-hour
+        for hour_str in sorted_hours:
+            hour_rounds = rounds_by_hour[hour_str]
+            hour_token_ids = set()
+            for r in hour_rounds:
+                hour_token_ids.add(r["details"]["clobTokenIds"][0])
+                hour_token_ids.add(r["details"]["clobTokenIds"][1])
                 
-            total_rounds += 1
-            sym = r["symbol"]
-            strike = r["strike"]
-            spot_at_close = r["close"]
+            url = f"https://r2v2.pmxt.dev/polymarket_orderbook_{hour_str}.parquet"
             
-            # Volatility Flash profile check to skip quiet periods
-            vol_5m = {"BTC": 0.0005, "ETH": 0.0007, "SOL": 0.0012, "XRP": 0.0015}.get(sym, 0.001)
-            candle_range_pct = (r["high"] - r["low"]) / r["strike"]
-            is_volatility_flash = (candle_range_pct >= self.vol_multiplier * vol_5m)
-            
-            if not is_volatility_flash:
+            df = None
+            try:
+                f = HTTPRangeFile(url, {'User-Agent': 'Mozilla/5.0'})
+                df = pd.read_parquet(
+                    f, 
+                    filters=[
+                        ('asset_id', 'in', list(hour_token_ids)),
+                        ('event_type', '==', 'last_trade_price')
+                    ],
+                    columns=['timestamp', 'event_type', 'asset_id', 'price', 'size', 'side']
+                )
+            except Exception as e:
                 if len(logs) < 200:
-                    logs.append(f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: Skipped quiet period (no high-frequency volatility flash). Bids expired unfilled ($0.00 USDC cost).")
+                    logs.append(f"[WARNING] Remote partition {hour_str} failed to load: {e}. Skipping rounds in this hour.")
                 continue
                 
-            # Place mock limit orders directly in the L2 bid/ask depth matrices
-            # Fills are logged 100% deterministically only when 1s tick physically crosses strike price
-            up_l1_filled = any(t["spot_price"] < strike for t in r["ticks"])
-            up_l2_filled = up_l1_filled
-            up_l3_filled = up_l1_filled
-            
-            down_l1_filled = any(t["spot_price"] > strike for t in r["ticks"])
-            down_l2_filled = down_l1_filled
-            down_l3_filled = down_l1_filled
-            
-            up_won = (spot_at_close >= strike)
-            down_won = not up_won
-            
-            round_cost = 0.0
-            round_shares = 0.0
-            round_pnl = 0.0
-            executions_in_round = 0
-            
-            # Evaluate Up contract fills
-            up_fills = [up_l1_filled, up_l2_filled, up_l3_filled]
-            up_prices = [0.030, 0.020, 0.010]
-            up_allocations = [0.10, 0.30, 0.60]
-            
-            for filled_flag, p_limit, alloc in zip(up_fills, up_prices, up_allocations):
-                if filled_flag:
-                    cost = alloc * self.base_size
-                    shares = cost / p_limit
-                    round_cost += cost
-                    round_shares += shares
-                    executions_in_round += 1
-                    
-                    pnl = (shares - cost) if up_won else -cost
-                    round_pnl += pnl
-                    if up_won:
-                        wins += 1
-                        gross_revenue += shares
-                    else:
-                        losses += 1
-                        
-            # Evaluate Down contract fills
-            down_fills = [down_l1_filled, down_l2_filled, down_l3_filled]
-            down_prices = [0.030, 0.020, 0.010]
-            down_allocations = [0.10, 0.30, 0.60]
-            
-            for filled_flag, p_limit, alloc in zip(down_fills, down_prices, down_allocations):
-                if filled_flag:
-                    cost = alloc * self.base_size
-                    shares = cost / p_limit
-                    round_cost += cost
-                    round_shares += shares
-                    executions_in_round += 1
-                    
-                    pnl = (shares - cost) if down_won else -cost
-                    round_pnl += pnl
-                    if down_won:
-                        wins += 1
-                        gross_revenue += shares
-                    else:
-                        losses += 1
-                        
-            if round_cost > 0.0:
-                total_executions += executions_in_round
-                equity += round_pnl
-                unique_rounds_entered += 1
+            if df is None or len(df) == 0:
+                continue
                 
-                # Check for parameter distortion warning (unique rounds > 150/day -> scale warning)
-                try:
-                    d1 = datetime.strptime(self.start_date, "%Y-%m-%d")
-                    d2 = datetime.strptime(self.end_date, "%Y-%m-%d")
-                    days_diff = max(1, (d2 - d1).days + 1)
-                except Exception:
-                    days_diff = 1
-                
-                if unique_rounds_entered > 150 * days_diff:
-                    logs.append(f"[WARNING] Parameter Distortion Alert: entered {unique_rounds_entered} rounds over {days_diff} days (exceeds 150/day cap).")
-                    
-                if len(logs) < 200:
-                    logs.append(
-                        f"[TRADE] Rd {total_rounds} {sym} @ Strike ${strike:,.2f}: Both sides limit orders evaluated. "
-                        f"Up Fills=[L1={up_l1_filled}, L2={up_l2_filled}, L3={up_l3_filled}], "
-                        f"Down Fills=[L1={down_l1_filled}, L2={down_l2_filled}, L3={down_l3_filled}] -> "
-                        f"Outcome: {'Up' if up_won else 'Down'} won. PnL: {round_pnl:+.2f} USDC. Wallet: ${equity:.2f}"
-                    )
+            df['price'] = df['price'].astype(float)
+            df['size'] = df['size'].astype(float)
+            if pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+                df['timestamp_sec'] = df['timestamp'].astype('int64') // 10**9
             else:
-                if len(logs) < 200:
-                    logs.append(
-                        f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: Passive resting buy limit orders on BOTH sides "
-                        f"expired unfilled ($0.00 USDC cost change)."
-                    )
-                    
-            equity_timeline.append({"time": total_rounds, "equity": equity})
+                df['timestamp_sec'] = df['timestamp'] // 1000
+                
+            df = df.sort_values(by='timestamp_sec')
             
-            if equity > max_equity:
-                max_equity = equity
-            dd = (max_equity - equity) / max_equity * 100.0
-            if dd > max_drawdown:
-                max_drawdown = dd
+            for r in hour_rounds:
+                if equity < self.base_size:
+                    logs.append(f"[LIQUIDATED] Simulation halted. Account balance (${equity:.2f}) dropped below base size (${self.base_size:.1f}).")
+                    break
+                    
+                total_rounds += 1
+                sym = r["symbol"]
+                epoch_start = r["epoch_start"]
+                epoch_close = r["epoch_close"]
+                yes_token = r["details"]["clobTokenIds"][0]
+                no_token = r["details"]["clobTokenIds"][1]
+                
+                question = r["details"].get("question", "")
+                match = re.search(r"\$(\d+(?:\.\d+)?)", question)
+                strike = float(match.group(1).replace(",", "")) if match else 0.0
+                
+                outcome_prices = r["details"].get("outcomePrices", [])
+                if len(outcome_prices) >= 2:
+                    p_yes = float(outcome_prices[0])
+                    if p_yes > 0.9:
+                        winner = "Up"
+                    else:
+                        winner = "Down"
+                else:
+                    winner = "Down"
+                    
+                up_won = (winner == "Up")
+                down_won = not up_won
+                
+                window_start = epoch_start + 295
+                window_end = epoch_start + 305
+                
+                round_trades = df[
+                    (df['timestamp_sec'] >= window_start) & 
+                    (df['timestamp_sec'] <= window_end)
+                ]
+                
+                yes_trades = round_trades[round_trades['asset_id'] == yes_token]
+                no_trades = round_trades[round_trades['asset_id'] == no_token]
+                
+                up_l1_filled = len(yes_trades[yes_trades['price'] <= 0.03]) > 0
+                up_l2_filled = len(yes_trades[yes_trades['price'] <= 0.02]) > 0
+                up_l3_filled = len(yes_trades[yes_trades['price'] <= 0.01]) > 0
+                
+                down_l1_filled = len(no_trades[no_trades['price'] <= 0.03]) > 0
+                down_l2_filled = len(no_trades[no_trades['price'] <= 0.02]) > 0
+                down_l3_filled = len(no_trades[no_trades['price'] <= 0.01]) > 0
+                
+                round_cost = 0.0
+                round_shares = 0.0
+                round_pnl = 0.0
+                executions_in_round = 0
+                
+                up_fills = [up_l1_filled, up_l2_filled, up_l3_filled]
+                up_prices = [0.030, 0.020, 0.010]
+                up_allocations = [0.10, 0.30, 0.60]
+                
+                for filled_flag, p_limit, alloc in zip(up_fills, up_prices, up_allocations):
+                    if filled_flag:
+                        cost = alloc * self.base_size
+                        shares = cost / p_limit
+                        round_cost += cost
+                        round_shares += shares
+                        executions_in_round += 1
+                        
+                        pnl = (shares - cost) if up_won else -cost
+                        round_pnl += pnl
+                        if up_won:
+                            wins += 1
+                            gross_revenue += shares
+                        else:
+                            losses += 1
+                            
+                down_fills = [down_l1_filled, down_l2_filled, down_l3_filled]
+                down_prices = [0.030, 0.020, 0.010]
+                down_allocations = [0.10, 0.30, 0.60]
+                
+                for filled_flag, p_limit, alloc in zip(down_fills, down_prices, down_allocations):
+                    if filled_flag:
+                        cost = alloc * self.base_size
+                        shares = cost / p_limit
+                        round_cost += cost
+                        round_shares += shares
+                        executions_in_round += 1
+                        
+                        pnl = (shares - cost) if down_won else -cost
+                        round_pnl += pnl
+                        if down_won:
+                            wins += 1
+                            gross_revenue += shares
+                        else:
+                            losses += 1
+                            
+                if round_cost > 0.0:
+                    total_executions += executions_in_round
+                    equity += round_pnl
+                    unique_rounds_entered += 1
+                    
+                    if len(logs) < 200:
+                        logs.append(
+                            f"[TRADE] Rd {total_rounds} {sym} @ Strike ${strike:,.2f}: Both sides limit orders evaluated. "
+                            f"Up Fills=[L1={up_l1_filled}, L2={up_l2_filled}, L3={up_l3_filled}], "
+                            f"Down Fills=[L1={down_l1_filled}, L2={down_l2_filled}, L3={down_l3_filled}] -> "
+                            f"Outcome: {winner} won. PnL: {round_pnl:+.2f} USDC. Wallet: ${equity:.2f}"
+                        )
+                else:
+                    if len(logs) < 200:
+                        logs.append(
+                            f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: Passive resting buy limit orders on BOTH sides "
+                            f"expired unfilled ($0.00 USDC cost change)."
+                        )
+                        
+                equity_timeline.append({"time": total_rounds, "equity": equity})
+                
+                if equity > max_equity:
+                    max_equity = equity
+                dd = (max_equity - equity) / max_equity * 100.0
+                if dd > max_drawdown:
+                    max_drawdown = dd
+                    
+            if equity < self.base_size:
+                break
                 
         net_profit = equity - self.start_balance
         win_rate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
