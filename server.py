@@ -446,7 +446,13 @@ class TradingEngine:
                 elif action == "run_backtest":
                     params = data.get("params", {})
                     self.add_system_log("Running historical backtest simulation request...")
-                    results = await asyncio.to_thread(self.run_backtest_simulation, params)
+                    try:
+                        results = await asyncio.wait_for(asyncio.to_thread(self.run_backtest_simulation, params), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        results = {
+                            "error": "Backtest execution timed out (30s limit exceeded).",
+                            "logs": ["[BACKTEST TIMEOUT] Simulation aborted: execution exceeded 30 seconds timeout limit."]
+                        }
                     await websocket.send(json.dumps({
                         "type": "backtest_results",
                         "results": results
@@ -794,10 +800,18 @@ class TradingEngine:
                     }
                 }
 
-                if not fence_active:
+                if time_remaining <= 0:
+                    # Enforce strict epoch boundaries: instantly clear associated resting limit orders on close
+                    self.resting_limit_orders = [o for o in self.resting_limit_orders if o["slug"] != slug]
+
+                if not fence_active and time_remaining > 0 and t < market["close_time"]:
                     # Evaluate active resting limit orders for this slug
                     for order in list(self.resting_limit_orders):
                         if order["slug"] == slug:
+                            # Reject fill attempt if market has closed
+                            if t >= market["close_time"] or time_remaining <= 0:
+                                continue
+
                             is_fill = False
                             if order["outcome"] == "Up" and price_yes <= order["price"]:
                                 is_fill = True
@@ -1440,6 +1454,15 @@ class TradingEngine:
                     
         if is_websocket:
             return None # Proceed to websocket handler
+
+        if path == "/api/export-logs" or path.startswith("/api/export-logs"):
+            csv_content, filename = self.generate_csv_string()
+            headers = [
+                ("Content-Type", "text/csv"),
+                ("Content-Disposition", f"attachment; filename={filename}"),
+                ("Access-Control-Allow-Origin", "*")
+            ]
+            return http.HTTPStatus.OK, headers, csv_content.encode("utf-8")
             
         # Default to index.html for SPA router requests
         if path == "/" or not "." in path.split("/")[-1]:
@@ -1474,13 +1497,24 @@ class TradingEngine:
             return http.HTTPStatus.INTERNAL_SERVER_ERROR, [("Content-Type", "text/plain")], f"Error: {e}".encode()
 
     def generate_csv_string(self):
-        """Queries database and generates the CSV content as a string."""
+        """Queries database and generates the CSV content as a string, sanitizing NULL/NaN values."""
         import io
         import csv
+        import math
         from datetime import datetime, timezone
         
         date_str = datetime.now(timezone.utc).strftime("%Y_%m_%d")
         filename = f"poly_bot_live_dump_{date_str}.csv"
+        
+        def sanitize(val):
+            if val is None:
+                return ""
+            if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                return ""
+            val_str = str(val)
+            if val_str.lower() in ["none", "null", "nan"]:
+                return ""
+            return val_str
         
         try:
             query = """
@@ -1548,9 +1582,28 @@ class TradingEngine:
                 else:
                     side_mapped = "BUY_DOWN"
                     
+                usdc_val = round(price * size, 4) if price and size else ""
+                
                 writer.writerow([
-                    ts_ms, iso_str, slug, strat_mapped, mode, side_mapped, strike, spot, time_delta,
-                    price, size, round(price * size, 4), gas, status, block_reason, rejection, delta_spot_strike, tx_hash, parent_order_id
+                    sanitize(ts_ms),
+                    sanitize(iso_str),
+                    sanitize(slug),
+                    sanitize(strat_mapped),
+                    sanitize(mode),
+                    sanitize(side_mapped),
+                    sanitize(strike),
+                    sanitize(spot),
+                    sanitize(time_delta),
+                    sanitize(price),
+                    sanitize(size),
+                    sanitize(usdc_val),
+                    sanitize(gas),
+                    sanitize(status),
+                    sanitize(block_reason),
+                    sanitize(rejection),
+                    sanitize(delta_spot_strike),
+                    sanitize(tx_hash),
+                    sanitize(parent_order_id)
                 ])
                 
             return output.getvalue(), filename

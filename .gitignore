@@ -21,3 +21,7 @@ env/
 .vscode/
 .idea/
 .DS_Store
+
+# Local parquet cache
+parquet_cache/
+

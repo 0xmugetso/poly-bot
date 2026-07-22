@@ -8,57 +8,6 @@ import re
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 
-class HTTPRangeFile:
-    def __init__(self, url, headers=None):
-        self.url = url
-        self.headers = headers or {}
-        self.position = 0
-        self.closed = False
-        
-        # Query headers first to get total file size
-        req = urllib.request.Request(url, headers=self.headers, method='HEAD')
-        ctx = ssl._create_unverified_context()
-        try:
-            with urllib.request.urlopen(req, timeout=10, context=ctx) as res:
-                self.size = int(res.headers.get('Content-Length', 0))
-        except Exception:
-            self.size = 0
-            
-    def seek(self, offset, whence=0):
-        if whence == 0:
-            self.position = offset
-        elif whence == 1:
-            self.position += offset
-        elif whence == 2:
-            self.position = self.size + offset
-        return self.position
-        
-    def tell(self):
-        return self.position
-        
-    def read(self, size=-1):
-        if self.closed:
-            raise ValueError("I/O operation on closed file")
-        if size == -1:
-            size = self.size - self.position
-        if size <= 0:
-            return b""
-            
-        end = self.position + size - 1
-        req = urllib.request.Request(self.url, headers=self.headers)
-        req.add_header('Range', f'bytes={self.position}-{end}')
-        ctx = ssl._create_unverified_context()
-        try:
-            with urllib.request.urlopen(req, timeout=15, context=ctx) as res:
-                data = res.read()
-                self.position += len(data)
-                return data
-        except Exception as e:
-            raise e
-            
-    def close(self):
-        self.closed = True
-
 def get_market_details_cached(slug):
     cache_path = "market_details_cache.json"
     cache = {}
@@ -139,6 +88,7 @@ class Backtester:
         self.symbols = ["BTC", "ETH", "SOL", "XRP"]
 
     def run(self):
+        start_time = time.time()
         logs = []
         logs.append("[SYSTEM] Initializing Polymarket historical L2 backtest engine...")
         
@@ -168,6 +118,9 @@ class Backtester:
         logs.append("[SYSTEM] Querying Polymarket Gamma API metadata (with local cache)...")
         
         for t_close in close_times:
+            if time.time() - start_time > 30.0:
+                logs.append("[BACKTEST TIMEOUT] Metadata fetch exceeded 30 seconds limit.")
+                break
             epoch_start = t_close - 300
             for sym in self.symbols:
                 slug = f"{sym.lower()}-updown-5m-{epoch_start}"
@@ -207,6 +160,28 @@ class Backtester:
             
         sorted_hours = sorted(rounds_by_hour.keys())
         
+        # 3. Bulk pre-fetch missing parquet files into local parquet_cache directory
+        cache_dir = "parquet_cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        ctx = ssl._create_unverified_context()
+        
+        logs.append(f"[SYSTEM] Bulk pre-fetching Parquet archives for {len(sorted_hours)} hours...")
+        for hour_str in sorted_hours:
+            if time.time() - start_time > 30.0:
+                logs.append("[BACKTEST TIMEOUT] Parquet pre-fetch step exceeded 30 seconds limit.")
+                break
+                
+            local_parquet = os.path.join(cache_dir, f"polymarket_orderbook_{hour_str}.parquet")
+            if not os.path.exists(local_parquet) or os.path.getsize(local_parquet) == 0:
+                url = f"https://r2v2.pmxt.dev/polymarket_orderbook_{hour_str}.parquet"
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                try:
+                    with urllib.request.urlopen(req, timeout=15, context=ctx) as response, open(local_parquet, 'wb') as out_file:
+                        out_file.write(response.read())
+                except Exception as e:
+                    if len(logs) < 200:
+                        logs.append(f"[WARNING] Pre-fetch failed for {hour_str}: {e}")
+                        
         equity = self.start_balance
         max_equity = equity
         max_drawdown = 0.0
@@ -219,21 +194,26 @@ class Backtester:
         unique_rounds_entered = 0
         equity_timeline = [{"time": 0, "equity": equity}]
         
-        # 3. Process hour-by-hour
+        # 4. Process hour-by-hour using local batch files
         for hour_str in sorted_hours:
+            if time.time() - start_time > 30.0:
+                logs.append("[BACKTEST TIMEOUT] Simulation aborted: execution exceeded 30 seconds timeout limit.")
+                break
+                
             hour_rounds = rounds_by_hour[hour_str]
             hour_token_ids = set()
             for r in hour_rounds:
                 hour_token_ids.add(r["details"]["clobTokenIds"][0])
                 hour_token_ids.add(r["details"]["clobTokenIds"][1])
                 
-            url = f"https://r2v2.pmxt.dev/polymarket_orderbook_{hour_str}.parquet"
-            
+            local_parquet = os.path.join(cache_dir, f"polymarket_orderbook_{hour_str}.parquet")
+            if not os.path.exists(local_parquet) or os.path.getsize(local_parquet) == 0:
+                continue
+                
             df = None
             try:
-                f = HTTPRangeFile(url, {'User-Agent': 'Mozilla/5.0'})
                 df = pd.read_parquet(
-                    f, 
+                    local_parquet, 
                     filters=[
                         ('asset_id', 'in', list(hour_token_ids)),
                         ('event_type', '==', 'last_trade_price')
@@ -242,7 +222,7 @@ class Backtester:
                 )
             except Exception as e:
                 if len(logs) < 200:
-                    logs.append(f"[WARNING] Remote partition {hour_str} failed to load: {e}. Skipping rounds in this hour.")
+                    logs.append(f"[WARNING] Partition {hour_str} failed to parse: {e}. Skipping rounds in this hour.")
                 continue
                 
             if df is None or len(df) == 0:
@@ -258,6 +238,10 @@ class Backtester:
             df = df.sort_values(by='timestamp_sec')
             
             for r in hour_rounds:
+                if time.time() - start_time > 30.0:
+                    logs.append("[BACKTEST TIMEOUT] Simulation aborted: execution exceeded 30 seconds timeout limit.")
+                    break
+                    
                 if equity < self.base_size:
                     logs.append(f"[LIQUIDATED] Simulation halted. Account balance (${equity:.2f}) dropped below base size (${self.base_size:.1f}).")
                     break

@@ -391,14 +391,10 @@ export default function App() {
     }
   };
 
-  // Trigger manual CSV export of all database trades
+  // Trigger manual CSV export of all database trades via REST endpoint
   const handleExportCsv = () => {
-    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-      ws.current.send(JSON.stringify({ action: "export_telemetry" }));
-      addLocalSystemLog("Requesting database CSV snapshot from server...");
-    } else {
-      addLocalSystemLog("Database CSV export failed: Connection is offline.");
-    }
+    window.location.href = "/api/export-logs";
+    addLocalSystemLog("Triggered database CSV export download from /api/export-logs...");
   };
 
   const handleExportBacktestCsv = () => {
