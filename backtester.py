@@ -221,15 +221,14 @@ class Backtester:
         unique_rounds_entered = 0
         equity_timeline = [{"time": 0, "equity": equity}]
         
-        # Reset timer and memory baseline for the actual simulation execution loop
+        # 4. Process hour-by-hour using local batch files
         sim_start_time = time.time()
         initial_sim_mem = check_memory_usage_mb()
         
-        # 4. Process hour-by-hour using local batch files
         for hour_str in sorted_hours:
             current_mem = check_memory_usage_mb()
-            # Guard against memory leaks during simulation (> 1500 MB growth during simulation phase or total > 3000 MB)
-            if (current_mem - initial_sim_mem > 1500.0) or (current_mem > 3000.0):
+            # Guard against memory leaks during simulation (> 2000 MB growth during simulation phase or total > 4000 MB)
+            if (current_mem - initial_sim_mem > 2000.0) or (current_mem > 4000.0):
                 logs.append(f"[MEMORY_SAFETY_LIMIT_REACHED] Simulation halted: memory growth ({current_mem - initial_sim_mem:.1f} MB) exceeded safety threshold.")
                 break
 
