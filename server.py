@@ -403,7 +403,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "1.8.1"
+            "version": "1.9.0"
         }
 
     async def broadcast(self):
@@ -435,7 +435,8 @@ class TradingEngine:
                     self.latency_ms = max(0.5, self.latency_ms - 0.3)
                     self.add_system_log("Manual gas priority bump triggered. Network latency optimized.")
                 elif action in ["request_csv_data", "export_telemetry"]:
-                    csv_content, filename = self.generate_csv_string()
+                    limit_val = data.get("limit")
+                    csv_content, filename = self.generate_csv_string(limit=limit_val)
                     # Also write it locally to the server disk
                     await asyncio.to_thread(self.export_trades_to_csv, filename)
                     # Send response back to the requesting client
@@ -537,246 +538,136 @@ class TradingEngine:
             return 0.0
         mean = sum(prices) / len(prices)
         variance = sum((x - mean) ** 2 for x in prices) / (len(prices) - 1)
-        import math
-        return math.sqrt(variance)
+        return variance ** 0.5
 
     async def initialize_rolling_prices(self):
-        """Populates the 30-period rolling 1-minute price cache from Binance Spot REST API."""
-        self.add_system_log("Initializing rolling 30-minute price cache for volatility-scaled gates...")
-        now_ms = int(time.time() * 1000)
-        start_ms = now_ms - (35 * 60 * 1000)
+        """Pre-populates 30m rolling prices cache on startup via Binance REST API."""
         ctx = ssl._create_unverified_context()
-        
-        for sym in self.symbols:
-            pair = f"{sym}USDT"
-            hosts = ["https://api.binance.com", "https://api.binance.us"]
-            fetched = False
-            for host in hosts:
-                url = f"{host}/api/v3/klines?symbol={pair}&interval=1m&startTime={start_ms}&endTime={now_ms}&limit=50"
+        for symbol in ["BTC", "ETH", "SOL", "XRP"]:
+            ticker = f"{symbol}USDT"
+            url = f"https://api.binance.com/api/v3/klines?symbol={ticker}&interval=1m&limit=30"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            try:
+                res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=5, context=ctx)
+                data = json.loads(res.read().decode())
+                closes = [float(c[4]) for c in data]
+                self.rolling_prices[symbol] = closes
+                if closes:
+                    self.live_prices[symbol] = closes[-1]
+            except Exception as e:
+                # Fallback to Binance.US
                 try:
-                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                    res = urllib.request.urlopen(req, timeout=3, context=ctx).read()
-                    data = json.loads(res)
-                    if data and isinstance(data, list):
-                        closes = [float(row[4]) for row in data[-30:]]
-                        self.rolling_prices[sym] = closes
-                        self.add_system_log(f"Cached {len(closes)} rolling prices for {sym} (last: ${closes[-1]:.2f}).")
-                        fetched = True
-                        break
+                    url_us = f"https://api.binance.us/api/v3/klines?symbol={ticker}&interval=1m&limit=30"
+                    req_us = urllib.request.Request(url_us, headers={'User-Agent': 'Mozilla/5.0'})
+                    res_us = await asyncio.to_thread(urllib.request.urlopen, req_us, timeout=5, context=ctx)
+                    data_us = json.loads(res_us.read().decode())
+                    closes_us = [float(c[4]) for c in data_us]
+                    self.rolling_prices[symbol] = closes_us
+                    if closes_us:
+                        self.live_prices[symbol] = closes_us[-1]
                 except Exception:
-                    continue
-            if not fetched:
-                # Fallback mock values
-                mock_price = self.live_prices.get(sym, 10.0)
-                self.rolling_prices[sym] = [mock_price * (1 + random.uniform(-0.001, 0.001)) for _ in range(30)]
-                self.add_system_log(f"Binance API geoblocked. Generated 30 mock rolling prices for {sym}.")
+                    pass
 
     async def rolling_prices_update_loop(self):
-        """Appends latest spot prices to rolling cache every minute."""
+        """Appends current spot prices to rolling 30m cache every 60s."""
         while True:
             await asyncio.sleep(60)
-            if self.status != "RUNNING":
+            for symbol in ["BTC", "ETH", "SOL", "XRP"]:
+                spot = self.spot_prices.get(symbol)
+                if spot and spot > 0:
+                    self.rolling_prices[symbol].append(spot)
+                    if len(self.rolling_prices[symbol]) > 30:
+                        self.rolling_prices[symbol].pop(0)
+
+    async def sync_clob_clock(self):
+        """Continuously measures CLOB clock offset relative to local system time."""
+        while True:
+            try:
+                req = urllib.request.Request("https://clob.polymarket.com/time", headers={'User-Agent': 'Mozilla/5.0'})
+                ctx = ssl._create_unverified_context()
+                t0 = time.time()
+                res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=5, context=ctx)
+                t1 = time.time()
+                data = json.loads(res.read().decode())
+                clob_time = float(data.get("time", t1))
+                rtt = t1 - t0
+                synced_clob_time = clob_time + (rtt / 2.0)
+                self.clob_clock_offset = synced_clob_time - t1
+            except Exception:
+                pass
+            await asyncio.sleep(60)
+
+    async def fetch_active_polymarket_events(self):
+        """Discovers current 5M contracts across monitored assets."""
+        t_now = time.time() + self.clob_clock_offset
+        current_5m_epoch = int(t_now) - (int(t_now) % 300)
+        
+        ctx = ssl._create_unverified_context()
+        for symbol in ["BTC", "ETH", "SOL", "XRP"]:
+            slug = f"{symbol.lower()}-updown-5m-{current_5m_epoch}"
+            if slug in self.active_markets and not self.active_markets[slug].get("resolved"):
                 continue
-            for sym in self.symbols:
-                price = self.spot_prices.get(sym)
-                if price:
-                    self.rolling_prices[sym].append(price)
-                    if len(self.rolling_prices[sym]) > 30:
-                        self.rolling_prices[sym].pop(0)
-
-    def fetch_market_details(self, slug):
-        """Queries the Polymarket Gamma API to get details of a slug."""
-        try:
-            url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            res = urllib.request.urlopen(req).read()
-            data = json.loads(res)
-            if len(data) > 0:
-                return data[0]
-        except Exception:
-            pass
-        return None
-
-    def fetch_market_details_fallback(self, slug):
-        """Queries active Polymarket markets to find a matching slug as a fallback."""
-        try:
-            url = "https://gamma-api.polymarket.com/markets?active=true&limit=100"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            res = urllib.request.urlopen(req, timeout=5).read()
-            data = json.loads(res)
-            for market in data:
-                if market.get("slug") == slug:
-                    return market
-        except Exception:
-            pass
-        return None
+                
+            try:
+                url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=5, context=ctx)
+                data = json.loads(res.read().decode())
+                
+                if len(data) > 0:
+                    m = data[0]
+                    question = m.get("question", "")
+                    match = re.search(r"\$(\d+(?:\.\d+)?)", question)
+                    strike = float(match.group(1).replace(",", "")) if match else self.spot_prices.get(symbol, 0.0)
+                    
+                    tokens_raw = m.get("clobTokenIds", "[]")
+                    if isinstance(tokens_raw, str):
+                        tokens = json.loads(tokens_raw)
+                    else:
+                        tokens = tokens_raw or []
+                        
+                    condition_id = m.get("conditionId")
+                    
+                    self.active_markets[slug] = {
+                        "slug": slug,
+                        "symbol": symbol,
+                        "strike_price": strike,
+                        "epoch_start": current_5m_epoch,
+                        "close_time": current_5m_epoch + 300,
+                        "tokens": tokens,
+                        "conditionId": condition_id,
+                        "resolved": False,
+                        "price_yes": 0.50,
+                        "price_no": 0.50
+                    }
+                    
+                    # Also post resting maker limit buy orders on BOTH sides upon market discovery
+                    asyncio.create_task(self.place_resting_orders_both_sides(self.active_markets[slug]))
+            except Exception as e:
+                pass
 
     async def market_management_loop(self):
-        """Periodically syncs active 5M markets and resolves rounds."""
-        symbols = ["BTC", "ETH", "SOL", "XRP"]
-        
+        """Main engine execution loop evaluating active 5M markets."""
         while True:
-            if self.status != "RUNNING":
-                await asyncio.sleep(1)
-                continue
-                
-            t_synced = time.time() + self.clob_clock_offset
-            t = int(t_synced)
-            t_rounded_5m = t - (t % 300)
-            t_rounded_15m = t - (t % 900)
+            await self.fetch_active_polymarket_events()
+            t = time.time() + self.clob_clock_offset
             
-            # 1. Update active 5m markets
-            for symbol in symbols:
-                # We expect a market to exist for the current 5m interval
-                # Active round starts at t_rounded_5m, closes at t_rounded_5m + 300
-                slug_5m = f"{symbol.lower()}-updown-5m-{t_rounded_5m}"
-                close_time = t_rounded_5m + 300
-                time_remaining = close_time - t
-                
-                # Fetch details if not already loaded
-                if slug_5m not in self.active_markets:
-                    self.add_system_log(f"Syncing active contract details for: {slug_5m}")
-                    
-                    # Fetch real spot price first (bypass startup stale default race condition)
-                    stale_defaults = {"BTC": 67250.0, "ETH": 3480.0, "SOL": 142.50, "XRP": 0.58}
-                    current_spot = self.spot_prices[symbol]
-                    if current_spot == stale_defaults.get(symbol):
-                        try:
-                            pair = f"{symbol}USDT"
-                            url = f"https://api.binance.us/api/v3/ticker/price?symbol={pair}"
-                            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                            ctx = ssl._create_unverified_context()
-                            res = urllib.request.urlopen(req, timeout=2, context=ctx).read()
-                            price_data = json.loads(res)
-                            current_spot = float(price_data["price"])
-                            self.live_prices[symbol] = current_spot
-                            self.add_system_log(f"[SYSTEM] Stale default spot price detected. Restored real {symbol} price: ${current_spot:.2f}")
-                        except Exception:
-                            try:
-                                pair = f"{symbol}USDT"
-                                url = f"https://api.binance.com/api/v3/ticker/price?symbol={pair}"
-                                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                                ctx = ssl._create_unverified_context()
-                                res = urllib.request.urlopen(req, timeout=2, context=ctx).read()
-                                price_data = json.loads(res)
-                                current_spot = float(price_data["price"])
-                                self.live_prices[symbol] = current_spot
-                                self.add_system_log(f"[SYSTEM] Stale default spot price detected. Restored real {symbol} price: ${current_spot:.2f}")
-                            except Exception:
-                                pass
-                                
-                    details = await asyncio.to_thread(self.fetch_market_details, slug_5m)
-                    if not details:
-                        # Fallback logic loop: refresh from Gamma /markets wrapper
-                        self.add_system_log(f"Gamma slug query empty. Triggering active markets cache refresh fallback for {slug_5m}...")
-                        details = await asyncio.to_thread(self.fetch_market_details_fallback, slug_5m)
-                        
-                    if details:
-                        # Extract suffix and asset from details slug
-                        details_slug = details.get("slug", "")
-                        try:
-                            slug_parts = details_slug.split("-")
-                            details_suffix = int(slug_parts[-1])
-                            details_asset = slug_parts[0].upper()
-                        except Exception:
-                            details_suffix = 0
-                            details_asset = ""
-                            
-                        # Strict matching: Suffix must match active round time, and Asset must match symbol
-                        if details_suffix == t_rounded_5m and details_asset == symbol:
-                            # Extract real strike price from line, strike, or question text
-                            strike_val = details.get("line") or details.get("strike")
-                            if not strike_val:
-                                import re
-                                question = details.get("question", "")
-                                match = re.search(r"\$(\d+(?:\.\d+)?)", question)
-                                if match:
-                                    strike_val = float(match.group(1))
-                                    
-                            strike = float(strike_val) if strike_val else current_spot
-                            
-                            # Validate that the strike is within 0.5% of the current spot price
-                            if abs(strike - current_spot) / current_spot > 0.005:
-                                self.add_system_log(f"[WARNING] Stale strike price (${strike:.2f}) parsed from details for {slug_5m} (spot is ${current_spot:.2f}). Overriding with current spot price.")
-                                strike = current_spot
-                                
-                            self.active_markets[slug_5m] = {
-                                "symbol": symbol,
-                                "slug": slug_5m,
-                                "type": "5M",
-                                "start_time": t_rounded_5m,
-                                "close_time": close_time,
-                                "strike_price": strike,
-                                "id": details.get("id"),
-                                "clobTokenIds": json.loads(details.get("clobTokenIds", "[]")) if isinstance(details.get("clobTokenIds"), str) else details.get("clobTokenIds", []),
-                                "conditionId": details.get("conditionId"),
-                                "last_evaluated": 0,
-                                "resolved": False,
-                                "blocked_logged": False
-                            }
-                            self.add_system_log(f"Market Active: {slug_5m} | Strike Price Set: ${strike:,.2f}")
-                            asyncio.create_task(self.place_resting_orders_both_sides(self.active_markets[slug_5m]))
-                        else:
-                            self.add_system_log(f"[WARNING] Stale or misaligned contract details returned for {slug_5m}: asset={details_asset}, suffix={details_suffix}. Ignored.")
-                    else:
-                        # Fallback mock details if the live round isn't created on Gamma API yet
-                        self.active_markets[slug_5m] = {
-                            "symbol": symbol,
-                            "slug": slug_5m,
-                            "type": "5M",
-                            "start_time": t_rounded_5m,
-                            "close_time": close_time,
-                            "strike_price": current_spot,
-                            "id": f"mock-{t_rounded_5m}",
-                            "clobTokenIds": [f"yes-{t_rounded_5m}", f"no-{t_rounded_5m}"],
-                            "conditionId": f"cond-{t_rounded_5m}",
-                            "last_evaluated": 0,
-                            "resolved": False,
-                            "blocked_logged": False
-                        }
-                        asyncio.create_task(self.place_resting_orders_both_sides(self.active_markets[slug_5m]))
-
-            # 2. Evaluate execution triggers (-5s to +2s window)
             for slug, market in list(self.active_markets.items()):
-                if market["resolved"]:
+                if market.get("resolved"):
                     continue
                     
                 time_remaining = market["close_time"] - t
                 symbol = market["symbol"]
-                
-                # Verify that contract substring token asset == Binance inbound asset
-                try:
-                    contract_asset = slug.split("-")[0].upper()
-                except Exception:
-                    contract_asset = ""
-                    
-                if contract_asset != symbol:
-                    self.add_system_log(f"[ERROR] Asset mismatch: Contract asset '{contract_asset}' != feed asset '{symbol}'. Execution aborted.")
-                    continue
-                    
-                spot = self.spot_prices[symbol]
                 strike = market["strike_price"]
+                spot = self.spot_prices.get(symbol, strike)
                 
-                # Hard Stop Pre-Flight Validation Rule
-                trigger_spot_price = spot
-                strike_price = strike
-                if abs(trigger_spot_price - strike_price) / trigger_spot_price > 0.005:
-                    self.add_system_log(f"[ERROR] Data mapping corruption detected for {slug}. Forcing cache flush.")
-                    if slug in self.active_markets:
-                        self.active_markets.pop(slug)
-                    continue
+                # Check for 0.5s boundary fence
+                fence_active = (time_remaining <= 0.5)
                 
-                # Resting orders are held passively in the book (never cancelled prior to expiration)
-                fence_active = False
-                
-                # Dynamic contract pricing estimation based on spot vs strike
-                # Difference between spot and strike
+                # Dynamic spot vs strike diff
                 delta = spot - strike
                 
-                # Estimate contract prices: YES is Up, NO is Down
-                # If delta is positive and large, YES is high (0.95-0.99), NO is low (0.01-0.05)
-                # If delta is negative and large, NO is high (0.95-0.99), YES is low (0.01-0.05)
-                # Around delta = 0, they hover around 0.50.
+                # Simulated order book YES/NO pricing derived from spot vs strike delta
                 volatility_factor = 2.0 if symbol in ["BTC", "BNB"] else 0.1
                 val = -delta / volatility_factor
                 val = max(-50.0, min(50.0, val))
@@ -784,131 +675,17 @@ class TradingEngine:
                 price_yes = max(0.01, min(0.99, price_yes))
                 price_no = 1 - price_yes
                 
-                # Add price fields to active market info for UI display
                 market["time_remaining"] = time_remaining
                 market["price_yes"] = round(price_yes, 2)
                 market["price_no"] = round(price_no, 2)
                 
-                # Simulate order book bid/ask depth
-                market["order_book"] = {
-                    "YES": {
-                        "bids": [[round(price_yes - 0.01 * j, 2), random.randint(100, 1000)] for j in range(1, 4)],
-                        "asks": [[round(price_yes + 0.01 * j, 2), random.randint(100, 1000)] for j in range(1, 4)]
-                    },
-                    "NO": {
-                        "bids": [[round(price_no - 0.01 * j, 2), random.randint(100, 1000)] for j in range(1, 4)],
-                        "asks": [[round(price_no + 0.01 * j, 2), random.randint(100, 1000)] for j in range(1, 4)]
-                    }
-                }
-
-                if time_remaining <= 0:
-                    # Enforce strict epoch boundaries: instantly clear associated resting limit orders on close
-                    self.resting_limit_orders = [o for o in self.resting_limit_orders if o["slug"] != slug]
-
-                if not fence_active and time_remaining > 0 and t < market["close_time"]:
-                    # Evaluate active resting limit orders for this slug
-                    for order in list(self.resting_limit_orders):
-                        if order["slug"] == slug:
-                            # Reject fill attempt if market has closed
-                            if t >= market["close_time"] or time_remaining <= 0:
-                                continue
-
-                            is_fill = False
-                            if order["outcome"] == "Up" and price_yes <= order["price"]:
-                                is_fill = True
-                            elif order["outcome"] == "Down" and price_no <= order["price"]:
-                                is_fill = True
-                                
-                            if is_fill:
-                                cost = order["size"] * order["price"]
-                                if self.wallet >= cost:
-                                    self.wallet -= cost
-                                    self.total_trades_count += 1
-                                    
-                                    # Re-hydrate or update the LIMIT_POSTED activity log item to PENDING
-                                    matched_trade = None
-                                    for trade in self.activity_log:
-                                        if trade["tx_hash"] == order["tx_hash"]:
-                                            matched_trade = trade
-                                            break
-                                    
-                                    if matched_trade:
-                                        matched_trade["status"] = "PENDING"
-                                        matched_trade["reason"] = "Resting limit order filled by market taker"
-                                        self.db.resolve_trade(order["tx_hash"], "PENDING", None)
-                                    else:
-                                        trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "PENDING", order["tx_hash"], reason="Resting limit order filled by market taker")
-                                        trade["strategy"] = order["strategy"]
-                                        self.db.insert_trade(
-                                            order["tx_hash"], 
-                                            trade["datetime_utc"], 
-                                            slug, 
-                                            order["strategy"], 
-                                            order["outcome"], 
-                                            order["price"], 
-                                            order["size"], 
-                                            self.priority_gas_gwei, 
-                                            "PENDING",
-                                            execution_mode="MAKER_LIMIT",
-                                            strike_price=order.get("strike_price"),
-                                            trigger_spot_price=order.get("trigger_spot_price"),
-                                            time_delta_seconds=order.get("time_delta_seconds")
-                                        )
-                                    
-                                    self.add_system_log(f"[MAKER LIMIT FILLED] Limit order for {order['outcome']} filled on {slug} @ ${order['price']:.3f}")
-                                self.resting_limit_orders.remove(order)
-
-                    # Passive resting buy orders are managed on market registration
-                    pass
-
-                # 3. Post-Close Settlement Resolution (+2s grace period exploit)
-                # Polymarket oracle settlement delay allows scanning/executing for up to 2s post-close
+                # Settlement Resolution
                 if time_remaining < -2:
-                    # Clean up locks
                     if slug in self.market_locks:
                         self.market_locks.pop(slug)
-                        
-                    # Query Polymarket CLOB status first for each resting order before epoch turnover
                     condition_id = market.get("conditionId")
-                    
-                    # Create copy of resting limit orders to safely iterate and modify
-                    for order in list(self.resting_limit_orders):
-                        if order["slug"] == slug:
-                            # Query status of order from Polymarket CLOB
-                            order_status = await self.get_clob_order_status(order["tx_hash"])
-                            
-                            if order_status in ["FILLED", "PARTIALLY_FILLED"]:
-                                # Transition it to PENDING (for Oracle worker settlement)
-                                matched_trade = None
-                                for trade in self.activity_log:
-                                    if trade["tx_hash"] == order["tx_hash"]:
-                                        matched_trade = trade
-                                        break
-                                        
-                                if matched_trade and matched_trade["status"] == "LIMIT_POSTED":
-                                    matched_trade["status"] = "PENDING"
-                                    matched_trade["reason"] = "Resting limit order filled before close (determined via CLOB query)"
-                                    self.db.resolve_trade(order["tx_hash"], "PENDING", None)
-                                    
-                                if order in self.resting_limit_orders:
-                                    self.resting_limit_orders.remove(order)
-                            else:
-                                # strictly UNFILLED -> Cancel order
-                                if order in self.resting_limit_orders:
-                                    self.resting_limit_orders.remove(order)
-                                    
-                                for trade in self.activity_log:
-                                    if trade["tx_hash"] == order["tx_hash"] and trade["status"] == "LIMIT_POSTED":
-                                        trade["status"] = "CANCELLED"
-                                        trade["reason"] = "Failsafe active: Order unfilled at close, cancelled"
-                                        self.db.resolve_trade(order["tx_hash"], "CANCELLED", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
-                    
-                    # Trigger oracle polling and resolution in background
                     asyncio.create_task(self.poll_and_resolve_market(slug, strike, condition_id))
-                    
-                    # Remove from active listing
                     market["resolved"] = True
-                    self.active_markets.pop(slug)
             
             await self.broadcast()
             await asyncio.sleep(1.0)
@@ -1031,40 +808,25 @@ class TradingEngine:
             budget = self.max_position_size_usdc * level["allocation"]
             tasks.append(
                 self.post_maker_limit_order_async(
-                    market, "Up", level["price"], "Strategy B (Penny Sweep)", budget, parent_order_id=parent_order_id_up
+                    slug, "Up", level["price"], budget, strategy="Strategy B (Penny Sweep)", parent_order_id=parent_order_id_up
                 )
             )
+            
         # Place Down orders
         for level in levels:
             budget = self.max_position_size_usdc * level["allocation"]
             tasks.append(
                 self.post_maker_limit_order_async(
-                    market, "Down", level["price"], "Strategy B (Penny Sweep)", budget, parent_order_id=parent_order_id_down
+                    slug, "Down", level["price"], budget, strategy="Strategy B (Penny Sweep)", parent_order_id=parent_order_id_down
                 )
             )
             
-        # Broadcast all concurrent orders simultaneously
         await asyncio.gather(*tasks)
 
-    async def post_maker_limit_order_async(self, market, outcome, price, strategy_name, order_budget, parent_order_id=None):
-        """Simulates placing an asynchronous resting maker limit order on the CLOB."""
-        slug = market["slug"]
-        
-        # Simulate network latency of API request
+    async def post_maker_limit_order_async(self, slug, outcome, target_price, budget_usdc, strategy="Strategy B (Penny Sweep)", parent_order_id=None):
+        """Asynchronously posts resting maker limit buy orders."""
         await asyncio.sleep(random.uniform(0.01, 0.05))
         
-        shares = order_budget / price
-        priority_gas_gwei = self.priority_gas_gwei
-        spot = self.live_prices.get(market["symbol"], 0.0)
-        strike = market.get("strike_price", 0.0)
-        
-        if strike <= 0.0 or spot <= 0.0:
-            self.add_system_log(f"[WARNING] Aborting trade on {slug}: Strike or Spot price read failed (defaulted to 0.0)")
-            return
-            
-        time_delta = float(market["close_time"]) - (time.time() + self.clob_clock_offset)
-
-        # Check gas-adjusted expected net profit to clear block inclusion
         gas_cost_usdc = 150000 * (priority_gas_gwei * 1e-9) * self.matic_price
         expected_net_profit = (shares * (1.00 - price)) - gas_cost_usdc
         
@@ -1497,7 +1259,7 @@ class TradingEngine:
         except Exception as e:
             return http.HTTPStatus.INTERNAL_SERVER_ERROR, [("Content-Type", "text/plain")], f"Error: {e}".encode()
 
-    def generate_csv_string(self):
+    def generate_csv_string(self, limit=None):
         """Queries database and generates the CSV content as a string, sanitizing NULL/NaN values."""
         import io
         import csv
@@ -1505,8 +1267,37 @@ class TradingEngine:
         from datetime import datetime, timezone
         
         date_str = datetime.now(timezone.utc).strftime("%Y_%m_%d")
-        filename = f"poly_bot_live_dump_{date_str}.csv"
         
+        limit_clean = None
+        if limit is not None and str(limit).lower() != "all":
+            try:
+                limit_clean = int(limit)
+            except Exception:
+                limit_clean = None
+                
+        if limit_clean:
+            filename = f"poly_bot_live_dump_last_{limit_clean}_{date_str}.csv"
+            query = f"""
+            SELECT id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
+                   execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta, parent_order_id
+            FROM (
+                SELECT id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
+                       execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta, parent_order_id
+                FROM trades
+                ORDER BY timestamp_utc DESC
+                LIMIT {limit_clean}
+            ) sub
+            ORDER BY timestamp_utc ASC;
+            """
+        else:
+            filename = f"poly_bot_live_dump_all_{date_str}.csv"
+            query = """
+            SELECT id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
+                   execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta, parent_order_id
+            FROM trades
+            ORDER BY timestamp_utc ASC;
+            """
+            
         def sanitize(val):
             if val is None:
                 return ""
@@ -1518,12 +1309,6 @@ class TradingEngine:
             return val_str
         
         try:
-            query = """
-            SELECT id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
-                   execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta, parent_order_id
-            FROM trades
-            ORDER BY timestamp_utc ASC;
-            """
             cursor = self.db.execute(query)
             if not cursor:
                 return "Error querying database", filename

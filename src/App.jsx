@@ -224,6 +224,7 @@ export default function App() {
   const [currentTimes, setCurrentTimes] = useState({ local: "", utc: "", clob: "" });
   const [userHasScrolledUp, setUserHasScrolledUp] = useState(false);
   const [showConnectionConfig, setShowConnectionConfig] = useState(false);
+  const [showExportMenu, setShowExportMenu] = useState(false);
   const [customWsUrl, setCustomWsUrl] = useState(localStorage.getItem("custom_ws_url") || "");
   const [activeTab, setActiveTab] = useState("live");
   const [backtestParams, setBacktestParams] = useState({
@@ -391,26 +392,28 @@ export default function App() {
     }
   };
 
-  // Trigger manual CSV export of all database trades via REST API or WebSocket fallback
-  const handleExportCsv = async () => {
+  // Trigger manual CSV export of database trades via REST API or WebSocket fallback
+  const handleExportCsv = async (limit = "all") => {
+    setShowExportMenu(false);
     try {
       const savedUrl = localStorage.getItem("custom_ws_url");
       const wsUrl = savedUrl || import.meta.env.VITE_WS_URL || "ws://localhost:8000";
       let httpUrl = wsUrl.replace(/^ws:/, "http:").replace(/^wss:/, "https:");
       if (httpUrl.endsWith("/")) httpUrl = httpUrl.slice(0, -1);
       
-      const res = await fetch(`${httpUrl}/api/export-logs`);
+      const res = await fetch(`${httpUrl}/api/export-logs?limit=${limit}`);
       if (res.ok) {
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
         const timestamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "_").replace("T", "_");
-        link.download = `poly_bot_live_dump_${timestamp}.csv`;
+        const limitTag = limit && limit !== 'all' ? `_last_${limit}` : '_all';
+        link.download = `poly_bot_live_dump${limitTag}_${timestamp}.csv`;
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
-        addLocalSystemLog("[EXPORT] Downloaded database CSV snapshot via REST API.");
+        addLocalSystemLog(`[EXPORT] Downloaded database CSV snapshot (${limit === 'all' ? 'All' : `Last ${limit}`} trades) via REST API.`);
         return;
       }
     } catch (e) {
@@ -418,8 +421,8 @@ export default function App() {
     }
 
     if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-      ws.current.send(JSON.stringify({ action: "export_telemetry" }));
-      addLocalSystemLog("Requesting database CSV snapshot via WebSocket fallback...");
+      ws.current.send(JSON.stringify({ action: "export_telemetry", limit }));
+      addLocalSystemLog(`Requesting database CSV snapshot (${limit === 'all' ? 'All' : `Last ${limit}`} trades) via WebSocket fallback...`);
     } else {
       addLocalSystemLog("Database CSV export failed: Connection is offline.");
     }
@@ -554,7 +557,7 @@ export default function App() {
                 <h1 className="text-base sm:text-lg font-bold tracking-widest text-[#F8FAFC]">
                   POLY-BOT <span className="text-[#10B981]">//</span> {activeTab === "live" ? "LIVE" : "SIM"}
                 </h1>
-                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v1.8.1</span>
+                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v1.9.0</span>
               </div>
               <span className="text-[9px] sm:text-[10px] uppercase font-mono tracking-wider text-slate-500">
                 Web3 Latency Arbitrage & Sweeper
@@ -621,15 +624,64 @@ export default function App() {
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div 
+            className="relative"
+            onMouseEnter={() => setShowExportMenu(true)}
+            onMouseLeave={() => setShowExportMenu(false)}
+          >
             <button 
-              onClick={handleExportCsv}
+              onClick={() => setShowExportMenu(!showExportMenu)}
               className="px-2.5 py-1.5 rounded border border-sky-900/50 bg-sky-950/20 text-sky-400 hover:bg-sky-950/40 text-[10px] sm:text-xs font-medium transition-colors flex items-center gap-1.5"
               title="Export Telemetry Logs"
             >
               <Download size={12} />
               <span>Export</span>
             </button>
+
+            {/* Hover Popover Dropdown */}
+            {showExportMenu && (
+              <div className="absolute right-0 top-full mt-1 w-44 bg-[#0D0D15] border border-[#1E1E2F] rounded shadow-xl z-50 py-1.5 font-mono text-[10px]">
+                <div className="px-3 py-1 text-[8px] uppercase tracking-wider text-slate-500 border-b border-[#1E1E2F]/60 mb-1">
+                  Export Options
+                </div>
+                <button 
+                  onClick={() => handleExportCsv(100)}
+                  className="w-full text-left px-3 py-1.5 hover:bg-sky-950/50 text-slate-300 hover:text-sky-300 flex items-center justify-between transition-colors"
+                >
+                  <span>Last 100 Trades</span>
+                  <span className="text-[8px] text-slate-500">100</span>
+                </button>
+                <button 
+                  onClick={() => handleExportCsv(500)}
+                  className="w-full text-left px-3 py-1.5 hover:bg-sky-950/50 text-slate-300 hover:text-sky-300 flex items-center justify-between transition-colors"
+                >
+                  <span>Last 500 Trades</span>
+                  <span className="text-[8px] text-slate-500">500</span>
+                </button>
+                <button 
+                  onClick={() => handleExportCsv(1000)}
+                  className="w-full text-left px-3 py-1.5 hover:bg-sky-950/50 text-slate-300 hover:text-sky-300 flex items-center justify-between transition-colors"
+                >
+                  <span>Last 1,000 Trades</span>
+                  <span className="text-[8px] text-slate-500">1k</span>
+                </button>
+                <button 
+                  onClick={() => handleExportCsv(5000)}
+                  className="w-full text-left px-3 py-1.5 hover:bg-sky-950/50 text-slate-300 hover:text-sky-300 flex items-center justify-between transition-colors"
+                >
+                  <span>Last 5,000 Trades</span>
+                  <span className="text-[8px] text-slate-500">5k</span>
+                </button>
+                <div className="border-t border-[#1E1E2F]/60 my-1" />
+                <button 
+                  onClick={() => handleExportCsv("all")}
+                  className="w-full text-left px-3 py-1.5 hover:bg-emerald-950/50 text-emerald-400 hover:text-emerald-300 flex items-center justify-between font-semibold transition-colors"
+                >
+                  <span>Export All Trades</span>
+                  <span className="text-[8px] text-emerald-500/80">MAX</span>
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </header>
