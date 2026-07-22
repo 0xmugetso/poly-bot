@@ -403,7 +403,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "1.9.1"
+            "version": "1.9.2"
         }
 
     async def broadcast(self):
