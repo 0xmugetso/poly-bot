@@ -403,7 +403,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "1.9.0"
+            "version": "1.9.1"
         }
 
     async def broadcast(self):
@@ -470,7 +470,7 @@ class TradingEngine:
         Exhibits self-healing properties: falls back to Binance.US if the host is geoblocked (HTTP 451).
         Uses exponential backoff starting at 100ms (max 5s) for instant reconnects.
         """
-        pairs = ["btcusdt", "ethusdt", "solusdt", "xrpusdt", "bnbusdt"]
+        pairs = ["btcusdt", "ethusdt", "solusdt", "xrpusdt"]
         streams_param = "/".join(f"{p}@depth10@100ms" for p in pairs)
         
         global_url = f"wss://stream.binance.com:9443/stream?streams={streams_param}"
@@ -679,6 +679,69 @@ class TradingEngine:
                 market["price_yes"] = round(price_yes, 2)
                 market["price_no"] = round(price_no, 2)
                 
+                # Enforce epoch close boundary: transition unfilled orders to EXPIRED_UNFILLED with $0.00 USDC cost change
+                if time_remaining <= 0:
+                    for order in list(self.resting_limit_orders):
+                        if order["slug"] == slug:
+                            self.resting_limit_orders.remove(order)
+                            for trade in self.activity_log:
+                                if trade["tx_hash"] == order["tx_hash"] and trade["status"] == "LIMIT_POSTED":
+                                    trade["status"] = "EXPIRED_UNFILLED"
+                                    trade["reason"] = "Market epoch closed without fill at target limit price ($0.00 USDC cost change)"
+                                    resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                                    self.db.resolve_trade(order["tx_hash"], "EXPIRED_UNFILLED", resolved_time)
+
+                if time_remaining > 0 and t < market["close_time"]:
+                    for order in list(self.resting_limit_orders):
+                        if order["slug"] == slug:
+                            if t >= market["close_time"] or time_remaining <= 0:
+                                continue
+
+                            is_fill = False
+                            # Enforce P(UP) + P(DOWN) = 1.00: Up fills if price_yes <= order["price"]; Down if price_no <= order["price"]
+                            if order["outcome"] == "Up" and price_yes <= order["price"]:
+                                is_fill = True
+                            elif order["outcome"] == "Down" and price_no <= order["price"]:
+                                is_fill = True
+                                
+                            if is_fill:
+                                cost = order["size"] * order["price"]
+                                if self.wallet >= cost:
+                                    self.wallet -= cost
+                                    self.total_trades_count += 1
+                                    
+                                    matched_trade = None
+                                    for trade in self.activity_log:
+                                        if trade["tx_hash"] == order["tx_hash"]:
+                                            matched_trade = trade
+                                            break
+                                    
+                                    if matched_trade:
+                                        matched_trade["status"] = "PENDING"
+                                        matched_trade["reason"] = "Resting limit order filled by market taker"
+                                        self.db.resolve_trade(order["tx_hash"], "PENDING", None)
+                                    else:
+                                        trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "PENDING", order["tx_hash"], reason="Resting limit order filled by market taker")
+                                        trade["strategy"] = order["strategy"]
+                                        self.db.insert_trade(
+                                            order["tx_hash"], 
+                                            trade["datetime_utc"], 
+                                            slug, 
+                                            order["strategy"], 
+                                            order["outcome"], 
+                                            order["price"], 
+                                            order["size"], 
+                                            self.priority_gas_gwei, 
+                                            "PENDING",
+                                            execution_mode="MAKER_LIMIT",
+                                            strike_price=order.get("strike_price"),
+                                            trigger_spot_price=order.get("trigger_spot_price"),
+                                            time_delta_seconds=order.get("time_delta_seconds")
+                                        )
+                                    
+                                    self.add_system_log(f"[MAKER LIMIT FILLED] Limit order for {order['outcome']} filled on {slug} @ ${order['price']:.3f}")
+                                self.resting_limit_orders.remove(order)
+                
                 # Settlement Resolution
                 if time_remaining < -2:
                     if slug in self.market_locks:
@@ -790,34 +853,32 @@ class TradingEngine:
             retry_delay = min(10.0, retry_delay + 1.0)
 
     async def place_resting_orders_both_sides(self, market):
-        """Places passive resting maker limit buy orders on BOTH sides (Up and Down) simultaneously."""
+        """Places passive resting maker limit buy orders on BOTH sides (Up and Down) simultaneously using EGIG scaling."""
         slug = market["slug"]
         parent_order_id_up = f"parent-up-{slug}"
         parent_order_id_down = f"parent-down-{slug}"
         
-        # Allocate budget: 10% for $0.03, 30% for $0.02, 60% for $0.01
+        # EGIG Position Sizing Matrix: Favor $0.01 penny layers (+9,900% ROI payout asymmetry)
         levels = [
-            {"price": 0.030, "allocation": 0.10},
-            {"price": 0.020, "allocation": 0.30},
-            {"price": 0.010, "allocation": 0.60}
+            {"price": 0.010, "budget": 30.00}, # 3,000 shares @ $0.01
+            {"price": 0.020, "budget": 3.00},  # 150 shares @ $0.02
+            {"price": 0.030, "budget": 1.50}   # 50 shares @ $0.03
         ]
         
         tasks = []
         # Place Up orders
         for level in levels:
-            budget = self.max_position_size_usdc * level["allocation"]
             tasks.append(
                 self.post_maker_limit_order_async(
-                    slug, "Up", level["price"], budget, strategy="Strategy B (Penny Sweep)", parent_order_id=parent_order_id_up
+                    slug, "Up", level["price"], level["budget"], strategy="Strategy B (Penny Sweep)", parent_order_id=parent_order_id_up
                 )
             )
             
         # Place Down orders
         for level in levels:
-            budget = self.max_position_size_usdc * level["allocation"]
             tasks.append(
                 self.post_maker_limit_order_async(
-                    slug, "Down", level["price"], budget, strategy="Strategy B (Penny Sweep)", parent_order_id=parent_order_id_down
+                    slug, "Down", level["price"], level["budget"], strategy="Strategy B (Penny Sweep)", parent_order_id=parent_order_id_down
                 )
             )
             
@@ -827,14 +888,26 @@ class TradingEngine:
         """Asynchronously posts resting maker limit buy orders."""
         await asyncio.sleep(random.uniform(0.01, 0.05))
         
+        symbol = slug.split("-")[0].upper()
+        strike = self.active_markets.get(slug, {}).get("strike_price", 0.0)
+        spot = self.spot_prices.get(symbol, strike)
+        time_delta = float(self.active_markets.get(slug, {}).get("close_time", time.time() + 300)) - (time.time() + self.clob_clock_offset)
+        
+        if target_price <= 0.0 or budget_usdc <= 0.0:
+            return
+            
+        shares = budget_usdc / target_price
+        price = target_price
+        strategy_name = strategy
+        priority_gas_gwei = self.priority_gas_gwei
+        
         gas_cost_usdc = 150000 * (priority_gas_gwei * 1e-9) * self.matic_price
         expected_net_profit = (shares * (1.00 - price)) - gas_cost_usdc
         
         if expected_net_profit <= self.min_profit_threshold_usdc:
             self.add_system_log(f"[Blocked] Maker limit order on {slug} blocked: Expected net profit ({expected_net_profit:.4f}) <= threshold ({self.min_profit_threshold_usdc}).")
             
-            # Record blocked trade in database
-            tx_hash = f"0x{random.randbytes(32).hex()}"
+            tx_hash = f"0x{random.randbytes(16).hex()}"
             self.db.insert_trade(
                 tx_hash,
                 datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
@@ -854,8 +927,7 @@ class TradingEngine:
             )
             return
 
-        # Post resting limit order
-        tx_hash = f"0x{random.randbytes(32).hex()}"
+        tx_hash = f"0x{random.randbytes(16).hex()}"
         self.resting_limit_orders.append({
             "slug": slug,
             "outcome": outcome,
@@ -869,7 +941,6 @@ class TradingEngine:
             "parent_order_id": parent_order_id
         })
         
-        # Record trade as LIMIT_POSTED
         trade = self.add_activity(
             slug, 
             outcome, 
@@ -898,7 +969,7 @@ class TradingEngine:
             time_delta_seconds=time_delta,
             parent_order_id=parent_order_id
         )
-        self.add_system_log(f"[LIMIT_POSTED] Posted async maker limit order on {slug}: {shares:.1f} shares of {outcome} @ ${price:.3f} (parent: {parent_order_id})")
+        self.add_system_log(f"[LIMIT_POSTED] Posted async maker limit order on {slug}: {shares:.1f} shares of {outcome} @ ${price:.3f}")
 
     def post_maker_limit_order(self, market, outcome, price, strategy_name, budget_allocation=1.0, parent_order_id=None):
         """Simulates placing a resting maker limit order on the CLOB."""
