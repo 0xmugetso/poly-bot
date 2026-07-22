@@ -404,7 +404,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "1.9.3"
+            "version": "2.0.0"
         }
 
     async def broadcast(self):
@@ -466,73 +466,85 @@ class TradingEngine:
             self.clients.remove(websocket)
             self.add_system_log("Frontend client disconnected.")
 
-    async def binance_price_feed(self):
-        """Streams orderbook depth from Binance Spot WebSocket, calculates OBI, and derives mid-prices.
-        Exhibits self-healing properties: falls back to Binance.US if the host is geoblocked (HTTP 451).
-        Uses exponential backoff starting at 100ms (max 5s) for instant reconnects.
+    def supervise_task(self, name, coroutine_fn):
+        """Wraps a background asyncio task in a supervisor watchdog.
+        If the background loop encounters an exception or dies, logs the traceback
+        and restarts the task within 2 seconds.
         """
-        pairs = ["btcusdt", "ethusdt", "solusdt", "xrpusdt"]
-        streams_param = "/".join(f"{p}@depth10@100ms" for p in pairs)
+        async def _run():
+            while True:
+                try:
+                    self.add_system_log(f"[SUPERVISOR] Starting background loop task: '{name}'")
+                    await coroutine_fn()
+                except Exception as e:
+                    import traceback
+                    tb = traceback.format_exc()
+                    self.add_system_log(f"[TASK_CRASH] Background loop '{name}' died: {e}\n{tb}")
+                    await self.broadcast()
+                    await asyncio.sleep(2.0)
+        return asyncio.create_task(_run())
+
+    async def pyth_price_ws(self):
+        """Streams sub-second institutional price ticks from Pyth Network Hermes WebSocket (https://hermes.pyth.network).
+        Subscribes to Pyth feed IDs for BTC/USD, ETH/USD, SOL/USD, and XRP/USD.
+        """
+        pyth_url = "wss://hermes.pyth.network/ws"
+        feed_map = {
+            "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43": "BTC",
+            "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace": "ETH",
+            "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d": "SOL",
+            "0xec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8": "XRP"
+        }
         
-        global_url = f"wss://stream.binance.com:9443/stream?streams={streams_param}"
-        us_url = f"wss://stream.binance.us:9443/stream?streams={streams_param}"
-        
-        use_us_feed = False
-        retry_delay = 0.1
-        
+        for k, v in list(feed_map.items()):
+            if k.startswith("0x"):
+                feed_map[k[2:]] = v
+
+        retry_delay = 0.5
         while True:
-            url = us_url if use_us_feed else global_url
             try:
-                self.add_system_log(f"Connecting to {'Binance.US' if use_us_feed else 'Binance Global'} Combined Depth WebSocket...")
+                self.add_system_log("[PYTH HERMES] Connecting to Pyth Network Hermes WebSocket (wss://hermes.pyth.network/ws)...")
                 ssl_context = ssl._create_unverified_context()
-                async with websockets.connect(url, ssl=ssl_context) as ws:
-                    self.add_system_log(f"Subscribed to {'Binance.US' if use_us_feed else 'Binance Global'} 10-level @ 100ms partial book depth streams.")
-                    retry_delay = 0.1 # Reset on successful connection
+                async with websockets.connect(pyth_url, ssl=ssl_context) as ws:
+                    self.add_system_log("[PYTH HERMES] Connected. Subscribing to BTC/USD, ETH/USD, SOL/USD, and XRP/USD Pyth feeds...")
+                    sub_msg = {
+                        "type": "subscribe",
+                        "ids": list(feed_map.keys())
+                    }
+                    await ws.send(json.dumps(sub_msg))
+                    retry_delay = 0.5
                     
                     while True:
                         try:
-                            message = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                            msg = await asyncio.wait_for(ws.recv(), timeout=10.0)
                         except asyncio.TimeoutError:
-                            self.add_system_log("Binance WebSocket read timeout (10s). Triggering reconnect...")
+                            self.add_system_log("[PYTH HERMES] WebSocket read timeout (10s). Triggering reconnect...")
                             break
                             
-                        data = json.loads(message)
-                        if "stream" in data and "data" in data:
-                            stream_name = data["stream"]
-                            depth_data = data["data"]
+                        data = json.loads(msg)
+                        if data.get("type") == "price_update":
+                            feed = data.get("price_feed", {})
+                            feed_id = feed.get("id", "").lower()
+                            norm_id = feed_id if feed_id.startswith("0x") else f"0x{feed_id}"
+                            symbol = feed_map.get(norm_id) or feed_map.get(feed_id)
                             
-                            symbol = stream_name.split("@")[0].upper().replace("USDT", "").replace("USD", "")
-                            bids = depth_data.get("bids", [])
-                            asks = depth_data.get("asks", [])
-                            
-                            if bids and asks:
-                                # Calculate Order Book Imbalance (OBI)
-                                total_bid_vol = sum(float(b[1]) for b in bids)
-                                total_ask_vol = sum(float(a[1]) for a in asks)
+                            if symbol:
+                                p_obj = feed.get("price", {})
+                                raw_price = float(p_obj.get("price", 0))
+                                expo = int(p_obj.get("expo", 0))
+                                spot_price = raw_price * (10 ** expo)
                                 
-                                if (total_bid_vol + total_ask_vol) > 0:
-                                    obi = (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol)
-                                else:
-                                    obi = 0.0
-                                    
-                                self.live_obi[symbol] = obi
-                                
-                                # Derive Spot Price as best bid/ask mid point to maintain 100ms precision
-                                best_bid = float(bids[0][0])
-                                best_ask = float(asks[0][0])
-                                mid_price = (best_bid + best_ask) / 2.0
-                                self.live_prices[symbol] = mid_price
+                                if spot_price > 0:
+                                    self.live_prices[symbol] = spot_price
+                                    self.spot_prices[symbol] = spot_price
             except Exception as e:
-                err_str = str(e)
-                self.add_system_log(f"Binance WebSocket error: {err_str}")
-                if "451" in err_str and not use_us_feed:
-                    self.add_system_log("HTTP 451 detected (Geo-blocked). Switching to Binance.US feed...")
-                    use_us_feed = True
-                    retry_delay = 0.1
-                else:
-                    self.add_system_log(f"Reconnecting in {retry_delay:.2f}s...")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay = min(5.0, retry_delay * 2.0)
+                self.add_system_log(f"[PYTH HERMES] Connection error: {e}. Reconnecting in {retry_delay:.2f}s...")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(5.0, retry_delay * 2.0)
+
+    async def binance_price_feed(self):
+        """Fallback Binance price stream if needed."""
+        await self.pyth_price_ws()
 
     def calculate_std(self, prices):
         if len(prices) < 2:
@@ -556,7 +568,6 @@ class TradingEngine:
                 if closes:
                     self.live_prices[symbol] = closes[-1]
             except Exception as e:
-                # Fallback to Binance.US
                 try:
                     url_us = f"https://api.binance.us/api/v3/klines?symbol={ticker}&interval=1m&limit=30"
                     req_us = urllib.request.Request(url_us, headers={'User-Agent': 'Mozilla/5.0'})
@@ -597,6 +608,60 @@ class TradingEngine:
             except Exception:
                 pass
             await asyncio.sleep(60)
+
+    async def sync_polymarket_gamma_api(self):
+        """Continuously discovers active 5M markets from Polymarket Gamma API."""
+        ctx = ssl._create_unverified_context()
+        while True:
+            try:
+                url = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100"
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=5, context=ctx)
+                data = json.loads(res.read().decode())
+                
+                if not data or not isinstance(data, list):
+                    self.add_system_log("[GAMMA_API_ERROR] Gamma API market discovery returned empty or invalid payload.")
+                else:
+                    t_now = time.time() + self.clob_clock_offset
+                    current_5m_epoch = int(t_now) - (int(t_now) % 300)
+                    
+                    for m in data:
+                        slug = m.get("slug", "")
+                        if any(slug.startswith(f"{sym.lower()}-updown-5m-") for sym in ["btc", "eth", "sol", "xrp"]):
+                            if slug not in self.active_markets or self.active_markets[slug].get("resolved"):
+                                question = m.get("question", "")
+                                match = re.search(r"\$(\d+(?:\.\d+)?)", question)
+                                symbol = slug.split("-")[0].upper()
+                                strike = float(match.group(1).replace(",", "")) if match else self.spot_prices.get(symbol, 0.0)
+                                
+                                tokens_raw = m.get("clobTokenIds", "[]")
+                                if isinstance(tokens_raw, str):
+                                    tokens = json.loads(tokens_raw)
+                                else:
+                                    tokens = tokens_raw or []
+                                    
+                                condition_id = m.get("conditionId")
+                                match_epoch = re.search(r"-(\d+)$", slug)
+                                epoch_start = int(match_epoch.group(1)) if match_epoch else current_5m_epoch
+                                
+                                self.active_markets[slug] = {
+                                    "slug": slug,
+                                    "symbol": symbol,
+                                    "strike_price": strike,
+                                    "epoch_start": epoch_start,
+                                    "close_time": epoch_start + 300,
+                                    "tokens": tokens,
+                                    "conditionId": condition_id,
+                                    "resolved": False,
+                                    "price_yes": 0.50,
+                                    "price_no": 0.50
+                                }
+                                asyncio.create_task(self.place_resting_orders_both_sides(self.active_markets[slug]))
+                                self.add_system_log(f"[MARKET DISCOVERY] Discovered active 5M market: {slug} @ Strike ${strike:,.2f}")
+            except Exception as e:
+                self.add_system_log(f"[GAMMA_API_ERROR] Polymarket Gamma API market discovery failed: {e}")
+                
+            await asyncio.sleep(1.0)
 
     async def fetch_active_polymarket_events(self):
         """Discovers current 5M contracts across monitored assets."""
@@ -1480,13 +1545,12 @@ async def main():
     # Initialize rolling 30-minute prices on startup
     await engine.initialize_rolling_prices()
     
-    # Start background threads/tasks
-    asyncio.create_task(engine.binance_price_feed())
-    asyncio.create_task(engine.rolling_prices_update_loop())
-    asyncio.create_task(engine.sync_clob_clock())
-    asyncio.create_task(engine.market_management_loop())
-    asyncio.create_task(engine.latency_jitter_simulation())
-    asyncio.create_task(engine.automated_csv_export_loop())
+    # Start background tasks supervised by Exception Watchdog
+    engine.supervise_task("Pyth Hermes Price Feed", engine.pyth_price_ws)
+    engine.supervise_task("Polymarket Gamma API Sync", engine.sync_polymarket_gamma_api)
+    engine.supervise_task("Market Management Loop", engine.market_management_loop)
+    engine.supervise_task("Rolling Prices Update", engine.rolling_prices_update_loop)
+    engine.supervise_task("CLOB Clock Sync", engine.sync_clob_clock)
     
     # Run an initial export on startup to verify setup
     date_str = datetime.now(timezone.utc).strftime("%Y_%m_%d")
