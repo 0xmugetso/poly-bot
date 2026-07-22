@@ -89,15 +89,17 @@ def get_market_details_cached(slug):
                         "active": m.get("active")
                     }
                     cache[slug] = details
-                    # Enforce max 100 cache entries eviction
-                    if len(cache) > 100:
-                        keys_to_remove = list(cache.keys())[:-100]
+                    if len(cache) > 500:
+                        keys_to_remove = list(cache.keys())[:-500]
                         for k in keys_to_remove:
                             cache.pop(k, None)
                     with open(cache_path, "w") as f:
                         json.dump(cache, f)
                     return details
                 else:
+                    cache[slug] = None
+                    with open(cache_path, "w") as f:
+                        json.dump(cache, f)
                     return None
         except Exception as e:
             if "429" in str(e):
