@@ -148,8 +148,8 @@ class Backtester:
         logs.append("[SYSTEM] Querying Polymarket Gamma API metadata (with local cache)...")
         
         for t_close in close_times:
-            if time.time() - start_time > 30.0:
-                logs.append("[BACKTEST TIMEOUT] Metadata fetch exceeded 30 seconds limit.")
+            if time.time() - start_time > 45.0:
+                logs.append("[BACKTEST TIMEOUT] Metadata fetch exceeded 45 seconds limit.")
                 break
             epoch_start = t_close - 300
             for sym in self.symbols:
@@ -232,8 +232,8 @@ class Backtester:
                 logs.append(f"[MEMORY_SAFETY_LIMIT_REACHED] Simulation halted: memory growth ({current_mem - initial_sim_mem:.1f} MB) exceeded safety threshold.")
                 break
 
-            if time.time() - sim_start_time > 30.0:
-                logs.append("[BACKTEST TIMEOUT] Simulation aborted: execution exceeded 30 seconds timeout limit.")
+            if time.time() - sim_start_time > 45.0:
+                logs.append("[BACKTEST TIMEOUT] Simulation aborted: execution exceeded 45 seconds timeout limit.")
                 break
                 
             hour_rounds = rounds_by_hour[hour_str]
