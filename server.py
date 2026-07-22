@@ -450,11 +450,11 @@ class TradingEngine:
                     params = data.get("params", {})
                     self.add_system_log("Running historical backtest simulation request...")
                     try:
-                        results = await asyncio.wait_for(asyncio.to_thread(self.run_backtest_simulation, params), timeout=30.0)
+                        results = await asyncio.wait_for(asyncio.to_thread(self.run_backtest_simulation, params), timeout=60.0)
                     except asyncio.TimeoutError:
                         results = {
-                            "error": "Backtest execution timed out (30s limit exceeded).",
-                            "logs": ["[BACKTEST TIMEOUT] Simulation aborted: execution exceeded 30 seconds timeout limit."]
+                            "error": "Backtest execution timed out (60s limit exceeded).",
+                            "logs": ["[BACKTEST TIMEOUT] Simulation aborted: execution exceeded 60 seconds timeout limit."]
                         }
                     await websocket.send(json.dumps({
                         "type": "backtest_results",
