@@ -391,10 +391,38 @@ export default function App() {
     }
   };
 
-  // Trigger manual CSV export of all database trades via REST endpoint
-  const handleExportCsv = () => {
-    window.location.href = "/api/export-logs";
-    addLocalSystemLog("Triggered database CSV export download from /api/export-logs...");
+  // Trigger manual CSV export of all database trades via REST API or WebSocket fallback
+  const handleExportCsv = async () => {
+    try {
+      const savedUrl = localStorage.getItem("custom_ws_url");
+      const wsUrl = savedUrl || import.meta.env.VITE_WS_URL || "ws://localhost:8000";
+      let httpUrl = wsUrl.replace(/^ws:/, "http:").replace(/^wss:/, "https:");
+      if (httpUrl.endsWith("/")) httpUrl = httpUrl.slice(0, -1);
+      
+      const res = await fetch(`${httpUrl}/api/export-logs`);
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        const timestamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "_").replace("T", "_");
+        link.download = `poly_bot_live_dump_${timestamp}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        addLocalSystemLog("[EXPORT] Downloaded database CSV snapshot via REST API.");
+        return;
+      }
+    } catch (e) {
+      // Fallback to WebSocket if REST fetch fails or CORS occurs
+    }
+
+    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+      ws.current.send(JSON.stringify({ action: "export_telemetry" }));
+      addLocalSystemLog("Requesting database CSV snapshot via WebSocket fallback...");
+    } else {
+      addLocalSystemLog("Database CSV export failed: Connection is offline.");
+    }
   };
 
   const handleExportBacktestCsv = () => {
@@ -524,7 +552,7 @@ export default function App() {
             <div className="flex flex-col">
               <h1 className="text-base sm:text-lg font-bold tracking-widest text-[#F8FAFC] flex items-center gap-2">
                 POLY-BOT <span className="text-[#10B981]">//</span> {activeTab === "live" ? "LIVE" : "SIM"}
-                <span className="text-[10px] bg-emerald-950/80 text-emerald-400 border border-emerald-800/60 px-1.5 py-0.5 rounded font-mono font-normal">v1.8.0</span>
+                <span className="text-[10px] bg-emerald-950/80 text-emerald-400 border border-emerald-800/60 px-1.5 py-0.5 rounded font-mono font-normal">v1.8.1</span>
               </h1>
               <span className="text-[9px] sm:text-[10px] uppercase font-mono tracking-wider text-slate-500">
                 Web3 Latency Arbitrage & Sweeper
