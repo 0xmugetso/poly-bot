@@ -207,6 +207,7 @@ class Backtester:
                 except Exception as e:
                     if len(logs) < 200:
                         logs.append(f"[WARNING] Pre-fetch failed for {hour_str}: {e}")
+            gc.collect()
                         
         equity = self.start_balance
         max_equity = equity
@@ -220,14 +221,16 @@ class Backtester:
         unique_rounds_entered = 0
         equity_timeline = [{"time": 0, "equity": equity}]
         
-        # Reset timer for the actual simulation execution loop
+        # Reset timer and memory baseline for the actual simulation execution loop
         sim_start_time = time.time()
+        initial_sim_mem = check_memory_usage_mb()
         
         # 4. Process hour-by-hour using local batch files
         for hour_str in sorted_hours:
-            mem_mb = check_memory_usage_mb()
-            if mem_mb > 600.0:
-                logs.append(f"[MEMORY_SAFETY_LIMIT_REACHED] Simulation halted: RSS memory usage ({mem_mb:.1f} MB) exceeded 600 MB limit threshold.")
+            current_mem = check_memory_usage_mb()
+            # Guard against memory leaks during simulation (> 1500 MB growth during simulation phase or total > 3000 MB)
+            if (current_mem - initial_sim_mem > 1500.0) or (current_mem > 3000.0):
+                logs.append(f"[MEMORY_SAFETY_LIMIT_REACHED] Simulation halted: memory growth ({current_mem - initial_sim_mem:.1f} MB) exceeded safety threshold.")
                 break
 
             if time.time() - sim_start_time > 30.0:
