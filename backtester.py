@@ -108,7 +108,7 @@ def get_market_details_cached(slug):
 
 class Backtester:
     def __init__(self, start_date=None, end_date=None, proximity_limit=0.0002, obi_cutoff=0.65, base_size=10.0, start_balance=1000.0, vol_multiplier=4.8):
-        self.start_date = start_date or "2026-07-13"
+        self.start_date = start_date or "2026-07-14"
         self.end_date = end_date or "2026-07-14"
         self.proximity_limit = float(proximity_limit)
         self.obi_cutoff = float(obi_cutoff)
