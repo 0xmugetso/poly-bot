@@ -150,9 +150,6 @@ class Backtester:
         logs.append("[SYSTEM] Querying Polymarket Gamma API metadata (with local cache)...")
         
         for t_close in close_times:
-            if time.time() - start_time > 45.0:
-                logs.append("[BACKTEST TIMEOUT] Metadata fetch exceeded 45 seconds limit.")
-                break
             epoch_start = t_close - 300
             for sym in self.symbols:
                 slug = f"{sym.lower()}-updown-5m-{epoch_start}"
