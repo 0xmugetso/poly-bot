@@ -167,10 +167,6 @@ class Backtester:
         
         logs.append(f"[SYSTEM] Bulk pre-fetching Parquet archives for {len(sorted_hours)} hours...")
         for hour_str in sorted_hours:
-            if time.time() - start_time > 30.0:
-                logs.append("[BACKTEST TIMEOUT] Parquet pre-fetch step exceeded 30 seconds limit.")
-                break
-                
             local_parquet = os.path.join(cache_dir, f"polymarket_orderbook_{hour_str}.parquet")
             if not os.path.exists(local_parquet) or os.path.getsize(local_parquet) == 0:
                 url = f"https://r2v2.pmxt.dev/polymarket_orderbook_{hour_str}.parquet"
@@ -194,9 +190,12 @@ class Backtester:
         unique_rounds_entered = 0
         equity_timeline = [{"time": 0, "equity": equity}]
         
+        # Reset timer for the actual simulation execution loop
+        sim_start_time = time.time()
+        
         # 4. Process hour-by-hour using local batch files
         for hour_str in sorted_hours:
-            if time.time() - start_time > 30.0:
+            if time.time() - sim_start_time > 30.0:
                 logs.append("[BACKTEST TIMEOUT] Simulation aborted: execution exceeded 30 seconds timeout limit.")
                 break
                 
