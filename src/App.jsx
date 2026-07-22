@@ -522,8 +522,9 @@ export default function App() {
           <div className="flex items-center gap-3">
             <span className={`w-3 h-3 rounded-full ${status === 'RUNNING' && connected ? 'bg-emerald-500 pulse-green' : 'bg-rose-500'}`} />
             <div className="flex flex-col">
-              <h1 className="text-base sm:text-lg font-bold tracking-widest text-[#F8FAFC]">
+              <h1 className="text-base sm:text-lg font-bold tracking-widest text-[#F8FAFC] flex items-center gap-2">
                 POLY-BOT <span className="text-[#10B981]">//</span> {activeTab === "live" ? "LIVE" : "SIM"}
+                <span className="text-[10px] bg-emerald-950/80 text-emerald-400 border border-emerald-800/60 px-1.5 py-0.5 rounded font-mono font-normal">v1.8.0</span>
               </h1>
               <span className="text-[9px] sm:text-[10px] uppercase font-mono tracking-wider text-slate-500">
                 Web3 Latency Arbitrage & Sweeper
