@@ -24,7 +24,12 @@ def check_memory_usage_mb():
             pass
     try:
         import resource
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        import sys
+        rusage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == 'darwin':
+            return rusage / (1024 * 1024)  # macOS returns ru_maxrss in bytes
+        else:
+            return rusage / 1024          # Linux returns ru_maxrss in kilobytes
     except Exception:
         return 0.0
 
