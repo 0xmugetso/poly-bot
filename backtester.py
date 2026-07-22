@@ -5,8 +5,28 @@ import os
 import urllib.request
 import ssl
 import re
+import gc
 from datetime import datetime, timezone, timedelta
 import pandas as pd
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+def check_memory_usage_mb():
+    if HAS_PSUTIL:
+        try:
+            process = psutil.Process()
+            return process.memory_info().rss / (1024 * 1024)
+        except Exception:
+            pass
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except Exception:
+        return 0.0
 
 def get_market_details_cached(slug):
     cache_path = "market_details_cache.json"
@@ -64,6 +84,11 @@ def get_market_details_cached(slug):
                         "active": m.get("active")
                     }
                     cache[slug] = details
+                    # Enforce max 100 cache entries eviction
+                    if len(cache) > 100:
+                        keys_to_remove = list(cache.keys())[:-100]
+                        for k in keys_to_remove:
+                            cache.pop(k, None)
                     with open(cache_path, "w") as f:
                         json.dump(cache, f)
                     return details
@@ -195,6 +220,11 @@ class Backtester:
         
         # 4. Process hour-by-hour using local batch files
         for hour_str in sorted_hours:
+            mem_mb = check_memory_usage_mb()
+            if mem_mb > 600.0:
+                logs.append(f"[MEMORY_SAFETY_LIMIT_REACHED] Simulation halted: RSS memory usage ({mem_mb:.1f} MB) exceeded 600 MB limit threshold.")
+                break
+
             if time.time() - sim_start_time > 30.0:
                 logs.append("[BACKTEST TIMEOUT] Simulation aborted: execution exceeded 30 seconds timeout limit.")
                 break
@@ -362,7 +392,11 @@ class Backtester:
                     
             if equity < self.base_size:
                 break
-                
+
+            del df
+            gc.collect()
+
+        gc.collect()
         net_profit = equity - self.start_balance
         win_rate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
         

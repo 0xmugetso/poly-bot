@@ -275,9 +275,10 @@ class TradingEngine:
         self.rolling_prices = {sym: [] for sym in self.symbols}
         self.volatility_coefficient = 0.15
         
-        # Activity and logs
-        self.activity_log = []
-        self.system_logs = []
+        # Activity and logs (bounded deques to cap memory footprint < 10 MB)
+        from collections import deque
+        self.activity_log = deque(maxlen=1000)
+        self.system_logs = deque(maxlen=1000)
         
         self.status = "RUNNING"
         self.latency_ms = 1.4
@@ -403,7 +404,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "1.9.2"
+            "version": "1.9.3"
         }
 
     async def broadcast(self):
@@ -1463,8 +1464,14 @@ class TradingEngine:
                     sanitize(parent_order_id)
                 ])
                 
-            return output.getvalue(), filename
+            csv_data = output.getvalue()
+            output.close()
+            import gc
+            gc.collect()
+            return csv_data, filename
         except Exception as e:
+            import gc
+            gc.collect()
             return f"Error exporting CSV: {e}", filename
 
 async def main():
