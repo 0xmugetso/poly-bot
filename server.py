@@ -417,7 +417,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.0.3"
+            "version": "2.0.5"
         }
 
     async def broadcast(self):
@@ -832,6 +832,8 @@ class TradingEngine:
                                     trade["reason"] = "Market epoch closed without fill at target limit price ($0.00 USDC cost change)"
                                     resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
                                     self.db.resolve_trade(order["tx_hash"], "EXPIRED_UNFILLED", resolved_time)
+                    # Instantly purge expired market slug entry from active_markets
+                    self.active_markets.pop(slug, None)
 
                 if time_remaining > 0 and t < market["close_time"]:
                     for order in list(self.resting_limit_orders):

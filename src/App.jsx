@@ -354,6 +354,13 @@ export default function App() {
     catch (e) { return null; }
   };
 
+  const formatCountdown = (seconds) => {
+    const s = Math.max(0, Math.floor(seconds || 0));
+    const mins = Math.floor(s / 60);
+    const secs = s % 60;
+    return `T-${mins > 0 ? `${mins}m ` : ''}${secs < 10 ? '0' : ''}${secs}s`;
+  };
+
   // Standalone Client-Side Live Stream (Fallback when disconnected from Python WS server)
   useEffect(() => {
     if (connected) return;
@@ -761,7 +768,7 @@ export default function App() {
                 <h1 className="text-base sm:text-lg font-bold tracking-widest text-[#F8FAFC]">
                   POLY-BOT <span className="text-[#10B981]">//</span> {activeTab === "live" ? "LIVE" : "SIM"}
                 </h1>
-                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.0.3</span>
+                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.0.5</span>
               </div>
               <span className="text-[9px] sm:text-[10px] uppercase font-mono tracking-wider text-slate-500">
                 Web3 Latency Arbitrage & Sweeper
@@ -1027,52 +1034,59 @@ export default function App() {
             </h3>
             
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              {activeMarkets.map((market) => {
-                let statusColor = "bg-emerald-500 pulse-green";
-                let statusText = "STABLE";
-                if (marketLocks[market.slug]) {
-                  statusColor = "bg-rose-500 pulse-red";
-                  statusText = "LOCKED";
-                } else if (market.price_yes <= 0.05 || market.price_yes >= 0.95) {
-                  statusColor = "bg-amber-500 pulse-orange";
-                  statusText = "VOLATILE";
-                }
+              {activeMarkets
+                .filter((market) => {
+                  const tRem = market.time_remaining !== undefined ? market.time_remaining : (market.close_time ? market.close_time - (Date.now() / 1000) : 1);
+                  return tRem > 0;
+                })
+                .map((market) => {
+                  let statusColor = "bg-emerald-500 pulse-green";
+                  let statusText = "STABLE";
+                  if (marketLocks[market.slug]) {
+                    statusColor = "bg-rose-500 pulse-red";
+                    statusText = "LOCKED";
+                  } else if (market.price_yes <= 0.05 || market.price_yes >= 0.95) {
+                    statusColor = "bg-amber-500 pulse-orange";
+                    statusText = "VOLATILE";
+                  }
 
-                return (
-                  <div key={market.slug} className="border border-[#1E1E2F] rounded bg-black/40 p-3 flex flex-col gap-2">
-                    <div className="flex items-center justify-between border-b border-[#1E1E2F]/60 pb-1.5">
-                      <div className="flex items-center gap-1.5">
-                        <span className={`w-2 h-2 rounded-full ${statusColor}`} title={`Status: ${statusText}`} />
-                        <a 
-                          href={`https://polymarket.com/event/${market.slug}`} 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="text-xs font-bold text-slate-200 hover:text-[#10B981] flex items-center gap-1"
-                        >
-                          <span>{market.symbol} ({market.type})</span>
-                          <ExternalLink size={10} />
-                        </a>
+                  const tRem = market.time_remaining !== undefined ? market.time_remaining : (market.close_time ? market.close_time - (Date.now() / 1000) : 0);
+
+                  return (
+                    <div key={market.slug} className="border border-[#1E1E2F] rounded bg-black/40 p-3 flex flex-col gap-2">
+                      <div className="flex items-center justify-between border-b border-[#1E1E2F]/60 pb-1.5">
+                        <div className="flex items-center gap-1.5">
+                          <span className={`w-2 h-2 rounded-full ${statusColor}`} title={`Status: ${statusText}`} />
+                          <a 
+                            href={`https://polymarket.com/event/${market.slug}`} 
+                            target="_blank" 
+                            rel="noreferrer"
+                            className="text-xs font-bold text-slate-200 hover:text-[#10B981] flex items-center gap-1"
+                          >
+                            <span>{market.symbol}-5M</span>
+                            <ExternalLink size={10} />
+                          </a>
+                        </div>
+                        <span className={`text-[10px] font-mono font-medium px-1.5 py-0.5 rounded ${
+                          tRem <= 5 ? 'bg-rose-950/40 text-rose-400 border border-rose-900/40' : 'bg-slate-900 text-slate-400'
+                        }`}>
+                          {formatCountdown(tRem)}
+                        </span>
                       </div>
-                      <span className={`text-[10px] font-mono font-medium px-1.5 py-0.5 rounded ${
-                        market.time_remaining <= 5 ? 'bg-rose-950/40 text-rose-400 border border-rose-900/40' : 'bg-slate-900 text-slate-400'
-                      }`}>
-                        T-{market.time_remaining}s
-                      </span>
+                      
+                      <div className="text-[10px] font-mono flex flex-col gap-1 text-slate-400">
+                        <div className="flex justify-between">
+                          <span>Strike:</span>
+                          <span className="text-slate-200">${market.strike_price.toLocaleString(undefined, { minimumFractionDigits: PRICE_DECIMALS[market.symbol] || 2 })}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>YES / NO:</span>
+                          <span className="text-slate-200">${(market.price_yes || 0.5).toFixed(2)} / ${(market.price_no || 0.5).toFixed(2)}</span>
+                        </div>
+                      </div>
                     </div>
-                    
-                    <div className="text-[10px] font-mono flex flex-col gap-1 text-slate-400">
-                      <div className="flex justify-between">
-                        <span>Strike:</span>
-                        <span className="text-slate-200">${market.strike_price.toLocaleString(undefined, { minimumFractionDigits: PRICE_DECIMALS[market.symbol] || 2 })}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span>YES / NO:</span>
-                        <span className="text-slate-200">${market.price_yes.toFixed(2)} / ${market.price_no.toFixed(2)}</span>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
+                  );
+                })}
               {activeMarkets.length === 0 && (
                 <div className="col-span-full text-center py-10 text-slate-500 font-mono text-xs">
                   No active markets found. Syncing Polymarket Gamma API...
