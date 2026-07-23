@@ -417,7 +417,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.0.6"
+            "version": "2.0.7"
         }
 
     async def broadcast(self):
@@ -820,32 +820,41 @@ class TradingEngine:
                 price_yes = max(0.01, min(0.99, price_yes))
                 price_no = 1 - price_yes
                 
+    async def market_management_loop(self):
+        """Main engine execution loop evaluating active 5M markets, fills, and epoch turnover."""
+        while True:
+            await self.fetch_active_polymarket_events()
+            t = time.time() + self.clob_clock_offset
+            
+            for slug, market in list(self.active_markets.items()):
+                if market.get("resolved"):
+                    continue
+                    
+                time_remaining = market["close_time"] - t
+                symbol = market["symbol"]
+                strike = market["strike_price"]
+                spot = self.spot_prices.get(symbol, strike)
+                
+                # Dynamic spot vs strike diff
+                delta = spot - strike
+                
+                # Simulated order book YES/NO pricing derived from spot vs strike delta
+                volatility_factor = 2.0 if symbol in ["BTC", "BNB"] else 0.1
+                val = -delta / volatility_factor
+                val = max(-50.0, min(50.0, val))
+                price_yes = 1 / (1 + 2.718 ** val)
+                price_yes = max(0.01, min(0.99, price_yes))
+                price_no = 1 - price_yes
+                
                 market["time_remaining"] = time_remaining
                 market["price_yes"] = round(price_yes, 2)
                 market["price_no"] = round(price_no, 2)
                 
-                # Enforce epoch close boundary: transition unfilled orders to EXPIRED_UNFILLED with $0.00 USDC cost change
-                if time_remaining <= 0:
-                    for order in list(self.resting_limit_orders):
-                        if order["slug"] == slug:
-                            self.resting_limit_orders.remove(order)
-                            for trade in self.activity_log:
-                                if trade["tx_hash"] == order["tx_hash"] and trade["status"] == "LIMIT_POSTED":
-                                    trade["status"] = "EXPIRED_UNFILLED"
-                                    trade["reason"] = "Market epoch closed without fill at target limit price ($0.00 USDC cost change)"
-                                    resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-                                    self.db.resolve_trade(order["tx_hash"], "EXPIRED_UNFILLED", resolved_time)
-                    # Instantly purge expired market slug entry from active_markets
-                    self.active_markets.pop(slug, None)
-
+                # WORKER 1: LIVE FILL WORKER (Evaluates resting orders during active round)
                 if time_remaining > 0 and t < market["close_time"]:
                     for order in list(self.resting_limit_orders):
                         if order["slug"] == slug:
-                            if t >= market["close_time"] or time_remaining <= 0:
-                                continue
-
                             is_fill = False
-                            # Enforce P(UP) + P(DOWN) = 1.00: Up fills if price_yes <= order["price"]; Down if price_no <= order["price"]
                             if order["outcome"] == "Up" and price_yes <= order["price"]:
                                 is_fill = True
                             elif order["outcome"] == "Down" and price_no <= order["price"]:
@@ -864,11 +873,11 @@ class TradingEngine:
                                             break
                                     
                                     if matched_trade:
-                                        matched_trade["status"] = "PENDING"
+                                        matched_trade["status"] = "FILLED"
                                         matched_trade["reason"] = "Resting limit order filled by market taker"
-                                        self.db.resolve_trade(order["tx_hash"], "PENDING", None)
+                                        self.db.resolve_trade(order["tx_hash"], "FILLED", None)
                                     else:
-                                        trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "PENDING", order["tx_hash"], reason="Resting limit order filled by market taker")
+                                        trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "FILLED", order["tx_hash"], reason="Resting limit order filled by market taker")
                                         trade["strategy"] = order["strategy"]
                                         self.db.insert_trade(
                                             order["tx_hash"], 
@@ -879,23 +888,44 @@ class TradingEngine:
                                             order["price"], 
                                             order["size"], 
                                             self.priority_gas_gwei, 
-                                            "PENDING",
+                                            "FILLED",
                                             execution_mode="MAKER_LIMIT",
                                             strike_price=order.get("strike_price"),
                                             trigger_spot_price=order.get("trigger_spot_price"),
                                             time_delta_seconds=order.get("time_delta_seconds")
                                         )
                                     
-                                    self.add_system_log(f"[MAKER LIMIT FILLED] Limit order for {order['outcome']} filled on {slug} @ ${order['price']:.3f}")
+                                    self.add_system_log(f"[MAKER LIMIT FILLED] Limit order for {order['outcome']} filled on {slug} @ ${order['price']:.3f} (Cost: ${cost:.2f} USDC)")
                                 self.resting_limit_orders.remove(order)
-                
-                # Settlement Resolution
-                if time_remaining < -2:
-                    if slug in self.market_locks:
-                        self.market_locks.pop(slug)
+
+                # WORKER 2: EPOCH TURNOVER RESOLVER (Triggers when 5m epoch completes)
+                if time_remaining <= 0:
+                    resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                    
+                    # A. Mark all unfilled resting orders in memory as EXPIRED_UNFILLED
+                    for order in list(self.resting_limit_orders):
+                        if order["slug"] == slug:
+                            self.resting_limit_orders.remove(order)
+                            for trade in self.activity_log:
+                                if trade["tx_hash"] == order["tx_hash"] and trade["status"] == "LIMIT_POSTED":
+                                    trade["status"] = "EXPIRED_UNFILLED"
+                                    trade["reason"] = "Market epoch closed without fill at target limit price ($0.00 USDC cost change)"
+                                    self.db.resolve_trade(order["tx_hash"], "EXPIRED_UNFILLED", resolved_time)
+
+                    # B. Update SQLite DB to guarantee 100% of LIMIT_POSTED rows for this slug transition to EXPIRED_UNFILLED
+                    self.db.execute(
+                        "UPDATE trades SET pnl_status = 'EXPIRED_UNFILLED', resolved_at = ? WHERE market_slug = ? AND pnl_status = 'LIMIT_POSTED'",
+                        (resolved_time, slug)
+                    )
+
+                    # C. Trigger async Oracle settlement resolution task for FILLED/PENDING orders
                     condition_id = market.get("conditionId")
                     asyncio.create_task(self.poll_and_resolve_market(slug, strike, condition_id))
-                    market["resolved"] = True
+                    
+                    # D. Purge expired market slug from active_markets
+                    self.active_markets.pop(slug, None)
+                    if slug in self.market_locks:
+                        self.market_locks.pop(slug)
             
             await self.broadcast()
             await asyncio.sleep(1.0)
@@ -913,7 +943,7 @@ class TradingEngine:
             # Fallback check for simulated/dry-run orders
             for trade in self.activity_log:
                 if trade["tx_hash"] == order_id:
-                    if trade["status"] in ["PENDING", "WIN", "LOSS"]:
+                    if trade["status"] in ["PENDING", "FILLED", "WIN", "LOSS"]:
                         return "FILLED"
             return "UNFILLED"
 
@@ -959,10 +989,14 @@ class TradingEngine:
             winner = await self.resolve_market_via_oracle(slug, condition_id)
             if winner:
                 resolved_any = False
-                for trade in self.activity_log:
-                    if trade["slug"] == slug and trade["status"] == "PENDING":
+                resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+                # 1. Settle in-memory activity_log trades
+                for trade in list(self.activity_log):
+                    if trade.get("slug") == slug and trade.get("status") in ["PENDING", "FILLED"]:
                         resolved_any = True
                         is_win = (trade["outcome"] == winner)
+                        cost = trade["size"] * trade["price"]
                         if is_win:
                             trade["status"] = "WIN"
                             trade["reason"] = f"Target outcome resolved successfully: {trade['outcome']} won at close"
@@ -971,21 +1005,49 @@ class TradingEngine:
                                 self.arbitrage_wins += 1
                             else:
                                 self.penny_wins += 1
-                            payout = trade["size"]
+                            payout = trade["size"] * 1.0
                             self.wallet += payout
-                            self.net_pnl_usdc += (payout - (trade["size"] * trade["price"]))
+                            self.net_pnl_usdc += (payout - cost)
                         else:
                             trade["status"] = "LOSS"
                             trade["reason"] = f"Target outcome expired worthless: opposite outcome won at close"
                             self.losses += 1
-                            self.net_pnl_usdc -= (trade["size"] * trade["price"])
+                            self.net_pnl_usdc -= cost
                         
                         self.resolved_trades_count += 1
                         self.net_pnl_pct = (self.net_pnl_usdc / self.initial_wallet) * 100
                         self.add_system_log(f"[ORACLE] Round Settled: {slug} | Winner: {winner} | Trade: {trade['status']}")
-                        
-                        resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
                         self.db.resolve_trade(trade["tx_hash"], trade["status"], resolved_time)
+
+                # 2. Query SQLite DB to settle any filled trades that fell out of activity_log memory queue
+                cursor = self.db.execute("SELECT id, outcome_bet, entry_price, position_size, strategy FROM trades WHERE market_slug = ? AND pnl_status IN ('PENDING', 'FILLED')", (slug,))
+                if cursor:
+                    rows = cursor.fetchall()
+                    for r in rows:
+                        resolved_any = True
+                        tx_id = r[0]
+                        out_bet = r[1]
+                        e_price = float(r[2]) if r[2] is not None else 0.0
+                        pos_size = float(r[3]) if r[3] is not None else 0.0
+                        strat = r[4] or ""
+                        cost = pos_size * e_price
+                        is_win = (out_bet == winner)
+                        st = "WIN" if is_win else "LOSS"
+                        if is_win:
+                            self.wins += 1
+                            if "Arbitrage" in strat:
+                                self.arbitrage_wins += 1
+                            else:
+                                self.penny_wins += 1
+                            payout = pos_size * 1.0
+                            self.wallet += payout
+                            self.net_pnl_usdc += (payout - cost)
+                        else:
+                            self.losses += 1
+                            self.net_pnl_usdc -= cost
+                        self.resolved_trades_count += 1
+                        self.db.resolve_trade(tx_id, st, resolved_time)
+                        self.add_system_log(f"[ORACLE] DB Trade Settled: {slug} | Winner: {winner} | Trade: {st}")
                 
                 if resolved_any:
                     self.add_system_log(f"[ORACLE] Cleaned up resolved contract state for: {slug}")

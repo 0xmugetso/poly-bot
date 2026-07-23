@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo, startTransition } from 'react';
 import { 
   Play, 
   Pause, 
@@ -710,20 +710,22 @@ export default function App() {
     }
   }, [systemLogs, isPausedStream, userHasScrolledUp]);
 
-  // Log filter helper
-  const filteredLogs = systemLogs.filter(log => {
-    if (logFilter === "ALL") return true;
-    if (logFilter === "TRADES") {
-      return log.includes("triggered") || log.includes("filled") || log.includes("Settled") || log.includes("Filled") || log.includes("LIMIT");
-    }
-    if (logFilter === "BLOCKED") {
-      return log.includes("[Blocked]") || log.includes("blocked") || log.includes("skipped");
-    }
-    if (logFilter === "SYSTEM") {
-      return !log.includes("triggered") && !log.includes("filled") && !log.includes("Settled") && !log.includes("[Blocked]") && !log.includes("blocked") && !log.includes("skipped") && !log.includes("Filled") && !log.includes("LIMIT");
-    }
-    return true;
-  });
+  // Log filter helper wrapped in useMemo to eliminate render lag
+  const filteredLogs = useMemo(() => {
+    return systemLogs.filter(log => {
+      if (logFilter === "ALL") return true;
+      if (logFilter === "TRADES") {
+        return log.includes("[TRADE]") || log.includes("[LIMIT_POSTED]") || log.includes("[MAKER LIMIT FILLED]") || log.includes("triggered") || log.includes("filled") || log.includes("Settled") || log.includes("Filled") || log.includes("LIMIT");
+      }
+      if (logFilter === "BLOCKED") {
+        return log.includes("[BLOCKED]") || log.includes("[Blocked]") || log.includes("blocked") || log.includes("skipped");
+      }
+      if (logFilter === "SYSTEM") {
+        return log.includes("[SYSTEM]") || (!log.includes("triggered") && !log.includes("filled") && !log.includes("Settled") && !log.includes("[Blocked]") && !log.includes("blocked") && !log.includes("skipped") && !log.includes("Filled") && !log.includes("LIMIT"));
+      }
+      return true;
+    });
+  }, [systemLogs, logFilter]);
 
   // Group and aggregate fractional order book fills by transaction hash or timestamp
   const getAggregatedActivityLog = () => {
@@ -766,7 +768,7 @@ export default function App() {
                 <h1 className="text-base sm:text-lg font-bold tracking-widest text-[#F8FAFC]">
                   POLY-BOT <span className="text-[#10B981]">//</span> {activeTab === "live" ? "LIVE" : "SIM"}
                 </h1>
-                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.0.6</span>
+                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.0.7</span>
               </div>
               <span className="text-[9px] sm:text-[10px] uppercase font-mono tracking-wider text-slate-500">
                 Web3 Latency Arbitrage & Sweeper
@@ -776,7 +778,11 @@ export default function App() {
           
           <div className="flex bg-[#040407] border border-[#1E1E2F] p-0.5 rounded gap-0.5 font-mono text-[9px] uppercase tracking-wider">
             <button 
-              onClick={() => setActiveTab("live")}
+              onClick={() => {
+                startTransition(() => {
+                  setActiveTab("live");
+                });
+              }}
               className={`px-2.5 py-1 rounded transition-colors ${
                 activeTab === "live" 
                   ? "bg-slate-800 text-slate-200 font-bold" 
@@ -786,7 +792,11 @@ export default function App() {
               Live
             </button>
             <button 
-              onClick={() => setActiveTab("backtest")}
+              onClick={() => {
+                startTransition(() => {
+                  setActiveTab("backtest");
+                });
+              }}
               className={`px-2.5 py-1 rounded transition-colors ${
                 activeTab === "backtest" 
                   ? "bg-slate-800 text-slate-200 font-bold" 
@@ -1198,7 +1208,11 @@ export default function App() {
                     {["ALL", "TRADES", "BLOCKED", "SYSTEM"].map((f) => (
                       <button
                         key={f}
-                        onClick={() => setLogFilter(f)}
+                        onClick={() => {
+                          startTransition(() => {
+                            setLogFilter(f);
+                          });
+                        }}
                         className={`px-1.5 py-0.5 rounded transition-colors ${
                           logFilter === f ? "bg-slate-800 text-slate-200 font-bold" : "hover:text-slate-300"
                         }`}

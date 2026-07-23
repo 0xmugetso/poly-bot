@@ -274,8 +274,8 @@ class Backtester:
                     logs.append("[BACKTEST TIMEOUT] Simulation aborted: execution exceeded 30 seconds timeout limit.")
                     break
                     
-                if equity < self.base_size:
-                    logs.append(f"[LIQUIDATED] Simulation halted. Account balance (${equity:.2f}) dropped below base size (${self.base_size:.1f}).")
+                if equity < self.round_budget:
+                    logs.append(f"[LIQUIDATED] Simulation halted. Account balance (${equity:.2f}) dropped below round budget (${self.round_budget:.1f}).")
                     break
                     
                 total_rounds += 1
@@ -397,7 +397,7 @@ class Backtester:
                 if dd > max_drawdown:
                     max_drawdown = dd
                     
-            if equity < self.base_size:
+            if equity < self.round_budget:
                 break
 
             del df
