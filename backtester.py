@@ -316,59 +316,65 @@ class Backtester:
                 yes_trades = round_trades[round_trades['asset_id'] == yes_token]
                 no_trades = round_trades[round_trades['asset_id'] == no_token]
                 
-                up_l1_filled = len(yes_trades[yes_trades['price'] <= 0.03]) > 0
-                up_l2_filled = len(yes_trades[yes_trades['price'] <= 0.02]) > 0
-                up_l3_filled = len(yes_trades[yes_trades['price'] <= 0.01]) > 0
-                
-                down_l1_filled = len(no_trades[no_trades['price'] <= 0.03]) > 0
-                down_l2_filled = len(no_trades[no_trades['price'] <= 0.02]) > 0
-                down_l3_filled = len(no_trades[no_trades['price'] <= 0.01]) > 0
+                # EGIG Position Scaling Matrix Tiers:
+                # $0.01 Tier: Max Budget = $30.00 USDC -> 3,000 shares @ $0.01
+                # $0.02 Tier: Max Budget = $3.00 USDC -> 150 shares @ $0.02
+                # $0.03 Tier: Max Budget = $1.50 USDC -> 50 shares @ $0.03
+                tiers = [
+                    {"price": 0.010, "target_shares": 3000.0},
+                    {"price": 0.020, "target_shares": 150.0},
+                    {"price": 0.030, "target_shares": 50.0}
+                ]
                 
                 round_cost = 0.0
                 round_shares = 0.0
                 round_pnl = 0.0
                 executions_in_round = 0
                 
-                up_fills = [up_l1_filled, up_l2_filled, up_l3_filled]
-                up_prices = [0.030, 0.020, 0.010]
-                up_allocations = [0.10, 0.30, 0.60]
-                
-                for filled_flag, p_limit, alloc in zip(up_fills, up_prices, up_allocations):
-                    if filled_flag:
-                        cost = alloc * self.base_size
-                        shares = cost / p_limit
-                        round_cost += cost
-                        round_shares += shares
-                        executions_in_round += 1
-                        
-                        pnl = (shares - cost) if up_won else -cost
-                        round_pnl += pnl
-                        if up_won:
-                            wins += 1
-                            gross_revenue += shares
-                        else:
-                            losses += 1
+                # Evaluate UP (YES) outcome limit order fills strictly constrained by Parquet trade depth volume
+                for tier in tiers:
+                    p_lim = tier["price"]
+                    target_sh = tier["target_shares"]
+                    matching = yes_trades[yes_trades['price'] <= p_lim]
+                    if len(matching) > 0:
+                        avail_vol = float(matching['size'].sum())
+                        filled_sh = min(target_sh, avail_vol)
+                        if filled_sh > 0:
+                            cost = filled_sh * p_lim
+                            round_cost += cost
+                            round_shares += filled_sh
+                            executions_in_round += 1
                             
-                down_fills = [down_l1_filled, down_l2_filled, down_l3_filled]
-                down_prices = [0.030, 0.020, 0.010]
-                down_allocations = [0.10, 0.30, 0.60]
-                
-                for filled_flag, p_limit, alloc in zip(down_fills, down_prices, down_allocations):
-                    if filled_flag:
-                        cost = alloc * self.base_size
-                        shares = cost / p_limit
-                        round_cost += cost
-                        round_shares += shares
-                        executions_in_round += 1
-                        
-                        pnl = (shares - cost) if down_won else -cost
-                        round_pnl += pnl
-                        if down_won:
-                            wins += 1
-                            gross_revenue += shares
-                        else:
-                            losses += 1
+                            pnl = (filled_sh * 1.00 - cost) if up_won else -cost
+                            round_pnl += pnl
+                            if up_won:
+                                wins += 1
+                                gross_revenue += (filled_sh * 1.00)
+                            else:
+                                losses += 1
+                                
+                # Evaluate DOWN (NO) outcome limit order fills strictly constrained by Parquet trade depth volume
+                for tier in tiers:
+                    p_lim = tier["price"]
+                    target_sh = tier["target_shares"]
+                    matching = no_trades[no_trades['price'] <= p_lim]
+                    if len(matching) > 0:
+                        avail_vol = float(matching['size'].sum())
+                        filled_sh = min(target_sh, avail_vol)
+                        if filled_sh > 0:
+                            cost = filled_sh * p_lim
+                            round_cost += cost
+                            round_shares += filled_sh
+                            executions_in_round += 1
                             
+                            pnl = (filled_sh * 1.00 - cost) if down_won else -cost
+                            round_pnl += pnl
+                            if down_won:
+                                wins += 1
+                                gross_revenue += (filled_sh * 1.00)
+                            else:
+                                losses += 1
+                                
                 if round_cost > 0.0:
                     total_executions += executions_in_round
                     equity += round_pnl
@@ -376,10 +382,8 @@ class Backtester:
                     
                     if len(logs) < 200:
                         logs.append(
-                            f"[TRADE] Rd {total_rounds} {sym} @ Strike ${strike:,.2f}: Both sides limit orders evaluated. "
-                            f"Up Fills=[L1={up_l1_filled}, L2={up_l2_filled}, L3={up_l3_filled}], "
-                            f"Down Fills=[L1={down_l1_filled}, L2={down_l2_filled}, L3={down_l3_filled}] -> "
-                            f"Outcome: {winner} won. PnL: {round_pnl:+.2f} USDC. Wallet: ${equity:.2f}"
+                            f"[TRADE] Rd {total_rounds} {sym} @ Strike ${strike:,.2f}: Proven fill of {round_shares:,.0f} shares "
+                            f"(Cost: ${round_cost:.2f} USDC). Outcome: {winner} won -> PnL: {round_pnl:+.2f} USDC. Wallet: ${equity:,.2f}"
                         )
                 else:
                     if len(logs) < 200:
