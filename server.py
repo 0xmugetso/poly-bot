@@ -469,7 +469,7 @@ class TradingEngine:
     def supervise_task(self, name, coroutine_fn):
         """Wraps a background asyncio task in a supervisor watchdog.
         If the background loop encounters an exception or dies, logs the traceback
-        and restarts the task within 2 seconds.
+        directly to self.system_logs for the UI console monitor and restarts within 2s.
         """
         async def _run():
             while True:
@@ -479,54 +479,94 @@ class TradingEngine:
                 except Exception as e:
                     import traceback
                     tb = traceback.format_exc()
-                    self.add_system_log(f"[TASK_CRASH] Background loop '{name}' died: {e}\n{tb}")
+                    log_msg = f"[TASK_CRASH] Background loop '{name}' died: {e}. Restarting in 2s..."
+                    self.add_system_log(log_msg)
+                    print(f"{log_msg}\n{tb}")
                     await self.broadcast()
                     await asyncio.sleep(2.0)
         return asyncio.create_task(_run())
 
+    async def fetch_pyth_rest_fallback(self):
+        """Fetches Pyth REST price update fallback if WS ticks stall."""
+        try:
+            feed_ids = [
+                "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+                "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+                "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+                "0xec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8"
+            ]
+            feed_map = {
+                feed_ids[0]: "BTC",
+                feed_ids[1]: "ETH",
+                feed_ids[2]: "SOL",
+                feed_ids[3]: "XRP"
+            }
+            url = f"https://hermes.pyth.network/v2/updates/price/latest?" + "&".join(f"ids[]={fid}" for fid in feed_ids)
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            ctx = ssl._create_unverified_context()
+            res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=3, context=ctx)
+            data = json.loads(res.read().decode())
+            for feed in data.get("parsed", []):
+                fid = feed.get("id", "").lower()
+                norm_id = fid if fid.startswith("0x") else f"0x{fid}"
+                symbol = feed_map.get(norm_id)
+                if symbol:
+                    p = feed.get("price", {})
+                    raw_price = float(p.get("price", 0))
+                    expo = int(p.get("expo", 0))
+                    spot_price = raw_price * (10 ** expo)
+                    if spot_price > 0:
+                        self.live_prices[symbol] = spot_price
+                        self.spot_prices[symbol] = spot_price
+        except Exception:
+            pass
+
     async def pyth_price_ws(self):
-        """Streams sub-second institutional price ticks from Pyth Network Hermes WebSocket (https://hermes.pyth.network).
-        Subscribes to Pyth feed IDs for BTC/USD, ETH/USD, SOL/USD, and XRP/USD.
+        """Streams sub-second institutional price ticks from Pyth Network Hermes WebSocket (wss://hermes.pyth.network/ws).
+        Subscribes using raw hex IDs without '0x' prefix and implements an instant 2s REST fallback.
         """
         pyth_url = "wss://hermes.pyth.network/ws"
-        feed_map = {
-            "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43": "BTC",
-            "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace": "ETH",
-            "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d": "SOL",
-            "0xec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8": "XRP"
+        raw_ids_map = {
+            "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43": "BTC",
+            "e62df6e014e2bf977008b283f31b2b5b093630f7b321700114357900dac22541": "BTC",
+            "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace": "ETH",
+            "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d": "SOL",
+            "ec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8": "XRP",
+            "ec5d39982219b5d37415893e3612d1c68d1dce7d63ef269ef50c1f6c770024f2": "XRP"
         }
         
-        for k, v in list(feed_map.items()):
-            if k.startswith("0x"):
-                feed_map[k[2:]] = v
-
+        subscription_ids = list(raw_ids_map.keys())
         retry_delay = 0.5
+        last_tick_time = time.time()
+
         while True:
             try:
                 self.add_system_log("[PYTH HERMES] Connecting to Pyth Network Hermes WebSocket (wss://hermes.pyth.network/ws)...")
                 ssl_context = ssl._create_unverified_context()
                 async with websockets.connect(pyth_url, ssl=ssl_context) as ws:
-                    self.add_system_log("[PYTH HERMES] Connected. Subscribing to BTC/USD, ETH/USD, SOL/USD, and XRP/USD Pyth feeds...")
+                    self.add_system_log("[PYTH HERMES] Connected. Subscribing using raw hex feed IDs (stripped of '0x' prefix)...")
                     sub_msg = {
                         "type": "subscribe",
-                        "ids": list(feed_map.keys())
+                        "ids": subscription_ids
                     }
                     await ws.send(json.dumps(sub_msg))
                     retry_delay = 0.5
                     
                     while True:
                         try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                            msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                            last_tick_time = time.time()
                         except asyncio.TimeoutError:
-                            self.add_system_log("[PYTH HERMES] WebSocket read timeout (10s). Triggering reconnect...")
-                            break
+                            if time.time() - last_tick_time >= 2.0:
+                                self.add_system_log("[PYTH HERMES] WS tick silent > 2s. Triggering instant Pyth REST fallback...")
+                                await self.fetch_pyth_rest_fallback()
+                            continue
                             
                         data = json.loads(msg)
                         if data.get("type") == "price_update":
                             feed = data.get("price_feed", {})
-                            feed_id = feed.get("id", "").lower()
-                            norm_id = feed_id if feed_id.startswith("0x") else f"0x{feed_id}"
-                            symbol = feed_map.get(norm_id) or feed_map.get(feed_id)
+                            feed_id = feed.get("id", "").lower().replace("0x", "")
+                            symbol = raw_ids_map.get(feed_id)
                             
                             if symbol:
                                 p_obj = feed.get("price", {})
@@ -537,8 +577,10 @@ class TradingEngine:
                                 if spot_price > 0:
                                     self.live_prices[symbol] = spot_price
                                     self.spot_prices[symbol] = spot_price
+                                    last_tick_time = time.time()
             except Exception as e:
-                self.add_system_log(f"[PYTH HERMES] Connection error: {e}. Reconnecting in {retry_delay:.2f}s...")
+                self.add_system_log(f"[PYTH HERMES] Connection error: {e}. Executing REST fallback & reconnecting in {retry_delay:.2f}s...")
+                await self.fetch_pyth_rest_fallback()
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(5.0, retry_delay * 2.0)
 
@@ -610,28 +652,31 @@ class TradingEngine:
             await asyncio.sleep(60)
 
     async def sync_polymarket_gamma_api(self):
-        """Continuously discovers active 5M markets from Polymarket Gamma API."""
+        """Discovers active and upcoming 5M crypto contracts via direct epoch slug targeting on Polymarket Gamma API."""
         ctx = ssl._create_unverified_context()
         while True:
             try:
-                url = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100"
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=5, context=ctx)
-                data = json.loads(res.read().decode())
+                t_now = int(time.time() + self.clob_clock_offset)
+                current_epoch = (t_now // 300) * 300
+                next_epoch = current_epoch + 300
                 
-                if not data or not isinstance(data, list):
-                    self.add_system_log("[GAMMA_API_ERROR] Gamma API market discovery returned empty or invalid payload.")
-                else:
-                    t_now = time.time() + self.clob_clock_offset
-                    current_5m_epoch = int(t_now) - (int(t_now) % 300)
-                    
-                    for m in data:
-                        slug = m.get("slug", "")
-                        if any(slug.startswith(f"{sym.lower()}-updown-5m-") for sym in ["btc", "eth", "sol", "xrp"]):
-                            if slug not in self.active_markets or self.active_markets[slug].get("resolved"):
+                discovered_any = False
+                for target_epoch in [current_epoch, next_epoch]:
+                    for sym in ["btc", "eth", "sol", "xrp"]:
+                        slug = f"{sym}-updown-5m-{target_epoch}"
+                        if slug in self.active_markets and not self.active_markets[slug].get("resolved"):
+                            continue
+                            
+                        url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+                        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                        try:
+                            res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=3, context=ctx)
+                            data = json.loads(res.read().decode())
+                            if data and isinstance(data, list) and len(data) > 0:
+                                m = data[0]
                                 question = m.get("question", "")
                                 match = re.search(r"\$(\d+(?:\.\d+)?)", question)
-                                symbol = slug.split("-")[0].upper()
+                                symbol = sym.upper()
                                 strike = float(match.group(1).replace(",", "")) if match else self.spot_prices.get(symbol, 0.0)
                                 
                                 tokens_raw = m.get("clobTokenIds", "[]")
@@ -641,23 +686,26 @@ class TradingEngine:
                                     tokens = tokens_raw or []
                                     
                                 condition_id = m.get("conditionId")
-                                match_epoch = re.search(r"-(\d+)$", slug)
-                                epoch_start = int(match_epoch.group(1)) if match_epoch else current_5m_epoch
                                 
                                 self.active_markets[slug] = {
                                     "slug": slug,
                                     "symbol": symbol,
                                     "strike_price": strike,
-                                    "epoch_start": epoch_start,
-                                    "close_time": epoch_start + 300,
+                                    "epoch_start": target_epoch,
+                                    "close_time": target_epoch + 300,
                                     "tokens": tokens,
                                     "conditionId": condition_id,
                                     "resolved": False,
                                     "price_yes": 0.50,
                                     "price_no": 0.50
                                 }
+                                discovered_any = True
                                 asyncio.create_task(self.place_resting_orders_both_sides(self.active_markets[slug]))
-                                self.add_system_log(f"[MARKET DISCOVERY] Discovered active 5M market: {slug} @ Strike ${strike:,.2f}")
+                                self.add_system_log(f"[MARKET DISCOVERY] Direct epoch discovery: {slug} @ Strike ${strike:,.2f}")
+                        except Exception:
+                            pass
+                if not discovered_any and len(self.active_markets) == 0:
+                    self.add_system_log("[GAMMA_API_ERROR] Direct epoch slug targeting returned 0 active 5M markets. Retrying on next tick...")
             except Exception as e:
                 self.add_system_log(f"[GAMMA_API_ERROR] Polymarket Gamma API market discovery failed: {e}")
                 
