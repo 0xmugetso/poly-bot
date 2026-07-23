@@ -28,6 +28,22 @@ try:
 except ImportError:
     HAS_POSTGRES = False
 
+from decimal import Decimal
+from collections import deque
+
+class CustomJSONEncoder(json.JSONEncoder):
+    """Custom JSON encoder handling datetime, Decimal, deque, sets, and custom objects safely."""
+    def default(self, obj):
+        if isinstance(obj, (datetime, Decimal)):
+            return str(obj)
+        if isinstance(obj, (set, deque)):
+            return list(obj)
+        if hasattr(obj, 'tolist'):
+            return obj.tolist()
+        if hasattr(obj, '__dict__'):
+            return obj.__dict__
+        return str(obj)
+
 class DatabaseManager:
     def __init__(self, log_fn):
         self.log_fn = log_fn
@@ -367,16 +383,12 @@ class TradingEngine:
             "reason": reason
         }
         self.activity_log.append(trade)
-        if len(self.activity_log) > 50:
-            self.activity_log.pop(0)
         return trade
 
     def add_system_log(self, msg):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         log_line = f"[{timestamp}] {msg}"
         self.system_logs.append(log_line)
-        if len(self.system_logs) > 100:
-            self.system_logs.pop(0)
         print(log_line)
 
     def get_state(self):
@@ -394,8 +406,8 @@ class TradingEngine:
             "spot_prices": self.spot_prices,
             "live_obi": self.live_obi,
             "active_markets": list(self.active_markets.values()),
-            "activity_log": self.activity_log,
-            "system_logs": self.system_logs[-20:],
+            "activity_log": list(self.activity_log),
+            "system_logs": list(self.system_logs)[-25:],
             "status": self.status,
             "latency_ms": round(self.latency_ms, 2),
             "rpc_node_health": self.rpc_node_health,
@@ -404,13 +416,13 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.0.1"
+            "version": "2.0.2"
         }
 
     async def broadcast(self):
         if not self.clients:
             return
-        state_str = json.dumps(self.get_state())
+        state_str = json.dumps(self.get_state(), cls=CustomJSONEncoder)
         disconnected = set()
         for client in list(self.clients):
             try:
@@ -426,7 +438,7 @@ class TradingEngine:
         self.add_system_log(f"Frontend client connected. Total clients: {len(self.clients)}")
         try:
             # Send initial engine state immediately on connection open
-            await websocket.send(json.dumps(self.get_state()))
+            await websocket.send(json.dumps(self.get_state(), cls=CustomJSONEncoder))
             async for message in websocket:
                 # Receive commands from frontend
                 data = json.loads(message)
@@ -440,14 +452,12 @@ class TradingEngine:
                 elif action in ["request_csv_data", "export_telemetry"]:
                     limit_val = data.get("limit")
                     csv_content, filename = self.generate_csv_string(limit=limit_val)
-                    # Also write it locally to the server disk
                     await asyncio.to_thread(self.export_trades_to_csv, filename)
-                    # Send response back to the requesting client
                     await websocket.send(json.dumps({
                         "type": "csv_data",
                         "filename": filename,
                         "csv_content": csv_content
-                    }))
+                    }, cls=CustomJSONEncoder))
                 elif action == "run_backtest":
                     params = data.get("params", {})
                     self.add_system_log("Running historical backtest simulation request...")
@@ -461,11 +471,15 @@ class TradingEngine:
                     await websocket.send(json.dumps({
                         "type": "backtest_results",
                         "results": results
-                    }))
+                    }, cls=CustomJSONEncoder))
         except Exception as e:
-            pass
+            import traceback
+            err_str = f"[WS_ERROR] WebSocket connection exception: {e}"
+            print(f"{err_str}\n{traceback.format_exc()}")
+            self.add_system_log(err_str)
         finally:
-            self.clients.remove(websocket)
+            if websocket in self.clients:
+                self.clients.remove(websocket)
             self.add_system_log("Frontend client disconnected.")
 
     def supervise_task(self, name, coroutine_fn):
