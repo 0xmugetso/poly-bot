@@ -417,7 +417,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.0.8"
+            "version": "2.0.9"
         }
 
     async def broadcast(self):
@@ -818,65 +818,16 @@ class TradingEngine:
                 market["price_yes"] = round(price_yes, 2)
                 market["price_no"] = round(price_no, 2)
                 
-                # Expiration Window Order Placement (Final 5.0s down to 0.6s before market close)
-                if time_remaining <= 5.0 and time_remaining >= 0.6 and not market.get("orders_posted"):
-                    market["orders_posted"] = True
-                    asyncio.create_task(self.place_resting_orders_both_sides(market))
-                    self.add_system_log(f"[EXPIRATION WINDOW] Deployed expiration boundary limit ladder for {slug} (T-{time_remaining:.1f}s remaining)")
+                # Dynamic CLOB Taker Sweeper Execution (Final 5.0s down to 0.6s before market close)
+                if time_remaining <= 5.0 and time_remaining >= 0.6 and not market.get("evaluated_sweep"):
+                    market["evaluated_sweep"] = True
+                    asyncio.create_task(self.evaluate_and_execute_clob_sweep(market))
 
-                # WORKER 1: LIVE FILL WORKER (Evaluates resting orders during active window)
-                if time_remaining > 0 and t < market["close_time"]:
-                    for order in list(self.resting_limit_orders):
-                        if order["slug"] == slug:
-                            is_fill = False
-                            if order["outcome"] == "Up" and price_yes <= order["price"]:
-                                is_fill = True
-                            elif order["outcome"] == "Down" and price_no <= order["price"]:
-                                is_fill = True
-                                
-                            if is_fill:
-                                cost = order["size"] * order["price"]
-                                if self.wallet >= cost:
-                                    self.wallet -= cost
-                                    self.total_trades_count += 1
-                                    
-                                    matched_trade = None
-                                    for trade in self.activity_log:
-                                        if trade["tx_hash"] == order["tx_hash"]:
-                                            matched_trade = trade
-                                            break
-                                    
-                                    if matched_trade:
-                                        matched_trade["status"] = "FILLED"
-                                        matched_trade["reason"] = "Resting limit order filled by market taker in expiration window"
-                                        self.db.resolve_trade(order["tx_hash"], "FILLED", None)
-                                    else:
-                                        trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "FILLED", order["tx_hash"], reason="Resting limit order filled by market taker in expiration window")
-                                        trade["strategy"] = order["strategy"]
-                                        self.db.insert_trade(
-                                            order["tx_hash"], 
-                                            trade["datetime_utc"], 
-                                            slug, 
-                                            order["strategy"], 
-                                            order["outcome"], 
-                                            order["price"], 
-                                            order["size"], 
-                                            self.priority_gas_gwei, 
-                                            "FILLED",
-                                            execution_mode="MAKER_LIMIT",
-                                            strike_price=order.get("strike_price"),
-                                            trigger_spot_price=order.get("trigger_spot_price"),
-                                            time_delta_seconds=order.get("time_delta_seconds")
-                                        )
-                                    
-                                    self.add_system_log(f"[MAKER LIMIT FILLED] Limit order for {order['outcome']} filled on {slug} @ ${order['price']:.3f} (Cost: ${cost:.2f} USDC)")
-                                self.resting_limit_orders.remove(order)
-
-                # WORKER 2: EPOCH TURNOVER RESOLVER (Triggers immediately when time_remaining <= 0.0)
+                # EPOCH TURNOVER RESOLVER (Triggers immediately when time_remaining <= 0.0)
                 if time_remaining <= 0.0:
                     resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
                     
-                    # A. Cancel all unfilled resting limit orders immediately at time_remaining <= 0.0
+                    # A. Cancel any remaining unfilled limit orders
                     for order in list(self.resting_limit_orders):
                         if order["slug"] == slug:
                             self.resting_limit_orders.remove(order)
@@ -903,6 +854,155 @@ class TradingEngine:
             
             await self.broadcast()
             await asyncio.sleep(0.5)
+
+    async def fetch_clob_book_asks(self, token_id):
+        """Fetches resting ask depth from Polymarket CLOB API for a given token_id."""
+        try:
+            url = f"https://clob.polymarket.com/book?token_id={token_id}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            ctx = ssl._create_unverified_context()
+            res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=3, context=ctx)
+            data = json.loads(res.read().decode())
+            asks = data.get("asks", [])
+            parsed = []
+            for a in asks:
+                parsed.append({
+                    "price": float(a.get("price", 0.0)),
+                    "size": float(a.get("size", 0.0))
+                })
+            parsed.sort(key=lambda x: x["price"])
+            return parsed
+        except Exception:
+            return []
+
+    async def evaluate_and_execute_clob_sweep(self, market):
+        """Evaluates live CLOB ask depth and Pyth spot toxicity, then executes dynamic taker sweeps."""
+        slug = market["slug"]
+        symbol = market["symbol"]
+        strike = market["strike_price"]
+        tokens = market.get("tokens", [])
+        spot = self.spot_prices.get(symbol, strike)
+        time_delta = float(market.get("close_time", time.time() + 300)) - (time.time() + self.clob_clock_offset)
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        # Toxicity Gate Safety Buffer per Symbol
+        safety_buffers = {"BTC": 2.0, "ETH": 0.2, "SOL": 0.05, "XRP": 0.0005}
+        buffer_val = safety_buffers.get(symbol, 0.1)
+        delta = spot - strike
+
+        # 1. Evaluate Non-Toxic Toxicity Gate
+        if abs(delta) < buffer_val:
+            reason = f"TOXIC_SPOT_FLIP (Spot ${spot:.2f} too close to Strike ${strike:.2f}, delta={delta:+.2f})"
+            self.add_system_log(f"[SWEEP_SKIPPED] {slug}: {reason}")
+            tx_hash = f"0x{random.randbytes(16).hex()}"
+            self.db.insert_trade(
+                tx_hash, now_utc, slug, "Strategy B (CLOB Sweeper)", "None", 0.0, 0.0,
+                self.priority_gas_gwei, "EXPIRED_UNFILLED", execution_mode="TAKER_SWEEP",
+                strike_price=strike, trigger_spot_price=spot, time_delta_seconds=time_delta,
+                block_reason="TOXIC_SPOT_FLIP", rejection_reason=reason, spot_strike_delta=delta
+            )
+            return
+
+        # 2. Determine target winning outcome and token
+        winning_outcome = "Up" if delta > 0 else "Down"
+        target_token = None
+        if len(tokens) >= 2:
+            target_token = tokens[0] if winning_outcome == "Up" else tokens[1]
+        elif len(tokens) == 1:
+            target_token = tokens[0]
+        else:
+            return
+
+        # 3. Read live Polymarket CLOB ask depth for <= $0.03
+        asks = await self.fetch_clob_book_asks(target_token)
+        asks_below_3c = [a for a in asks if 0.0 < a["price"] <= 0.03]
+
+        if not asks_below_3c:
+            # Fallback: check opposite token if asks <= 0.03 exist
+            opp_token = tokens[1] if target_token == tokens[0] and len(tokens) >= 2 else None
+            if opp_token:
+                opp_asks = await self.fetch_clob_book_asks(opp_token)
+                opp_below_3c = [a for a in opp_asks if 0.0 < a["price"] <= 0.03]
+                if opp_below_3c:
+                    asks_below_3c = opp_below_3c
+                    target_token = opp_token
+                    winning_outcome = "Down" if winning_outcome == "Up" else "Up"
+
+        if not asks_below_3c:
+            reason = "NO_ASK_DEPTH_BELOW_3C"
+            self.add_system_log(f"[SWEEP_SKIPPED] {slug}: No resting asks <= 3¢ on CLOB orderbook.")
+            tx_hash = f"0x{random.randbytes(16).hex()}"
+            self.db.insert_trade(
+                tx_hash, now_utc, slug, "Strategy B (CLOB Sweeper)", winning_outcome, 0.0, 0.0,
+                self.priority_gas_gwei, "EXPIRED_UNFILLED", execution_mode="TAKER_SWEEP",
+                strike_price=strike, trigger_spot_price=spot, time_delta_seconds=time_delta,
+                block_reason="NO_ASK_DEPTH_BELOW_3C", rejection_reason="No asks <= 3c", spot_strike_delta=delta
+            )
+            return
+
+        # 4. Execute Sweep up to max round budget
+        budget_remaining = self.max_order_size_usdc
+        total_acquired_shares = 0.0
+        total_cost_usdc = 0.0
+
+        for a in asks_below_3c:
+            p = a["price"]
+            s = a["size"]
+            max_sh = budget_remaining / p
+            take_sh = min(s, max_sh)
+            if take_sh > 0:
+                cost = take_sh * p
+                total_acquired_shares += take_sh
+                total_cost_usdc += cost
+                budget_remaining -= cost
+                if budget_remaining <= 0.001:
+                    break
+
+        if total_acquired_shares <= 0 or total_cost_usdc <= 0:
+            reason = "INSUFFICIENT_SWEEP_SIZE"
+            self.add_system_log(f"[SWEEP_SKIPPED] {slug}: Insufficient sweep volume available.")
+            return
+
+        weighted_avg_price = total_cost_usdc / total_acquired_shares
+
+        # Check gas profitability
+        gas_cost_usdc = 150000 * (self.priority_gas_gwei * 1e-9) * self.matic_price
+        expected_net_profit = (total_acquired_shares * (1.00 - weighted_avg_price)) - gas_cost_usdc
+        if expected_net_profit <= self.min_profit_threshold_usdc:
+            reason = f"GAS_UNPROFITABLE (Net profit ${expected_net_profit:.4f} <= ${self.min_profit_threshold_usdc:.2f})"
+            self.add_system_log(f"[SWEEP_SKIPPED] {slug}: {reason}")
+            tx_hash = f"0x{random.randbytes(16).hex()}"
+            self.db.insert_trade(
+                tx_hash, now_utc, slug, "Strategy B (CLOB Sweeper)", winning_outcome, weighted_avg_price, total_acquired_shares,
+                self.priority_gas_gwei, "BLOCKED_BY_GUARDRAIL", execution_mode="TAKER_SWEEP",
+                strike_price=strike, trigger_spot_price=spot, time_delta_seconds=time_delta,
+                block_reason="GAS_UNPROFITABLE", rejection_reason=reason, spot_strike_delta=delta
+            )
+            return
+
+        # Deduct wallet & record trade
+        if self.wallet >= total_cost_usdc:
+            self.wallet -= total_cost_usdc
+            self.total_trades_count += 1
+            tx_hash = f"0x{random.randbytes(16).hex()}"
+
+            trade = self.add_activity(
+                slug, winning_outcome, weighted_avg_price, total_acquired_shares, "FILLED", tx_hash,
+                reason=f"[SWEEP_EXECUTED] Swept {total_acquired_shares:.2f} shares @ avg ${weighted_avg_price:.3f} | Spot distance safe (${spot:.2f} vs ${strike:.2f})"
+            )
+            trade["strategy"] = "Strategy B (CLOB Sweeper)"
+
+            self.db.insert_trade(
+                tx_hash, now_utc, slug, "Strategy B (CLOB Sweeper)", winning_outcome,
+                weighted_avg_price, total_acquired_shares, self.priority_gas_gwei, "FILLED",
+                execution_mode="TAKER_SWEEP", strike_price=strike, trigger_spot_price=spot,
+                time_delta_seconds=time_delta, spot_strike_delta=delta
+            )
+
+            self.add_system_log(
+                f"[SWEEP_EXECUTED] Swept {total_acquired_shares:.2f} shares on {slug} @ avg ${weighted_avg_price:.3f} "
+                f"({weighted_avg_price*100:.1f}¢) | Cost: ${total_cost_usdc:.2f} USDC | Decision: SWEEP_EXECUTED"
+            )
 
     async def get_clob_order_status(self, order_id):
         """Queries the Polymarket CLOB GET /order/{order_id} endpoint for status."""

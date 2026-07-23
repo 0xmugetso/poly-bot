@@ -313,80 +313,59 @@ class Backtester:
                 yes_trades = round_trades[round_trades['asset_id'] == yes_token]
                 no_trades = round_trades[round_trades['asset_id'] == no_token]
                 
-                # EGIG Dynamic Position Scaling Matrix Tiers based on self.round_budget (Default $10.00):
-                # Tier 1 ($0.01 price): 60% budget -> shares = (0.60 * self.round_budget) / 0.010
-                # Tier 2 ($0.02 price): 30% budget -> shares = (0.30 * self.round_budget) / 0.020
-                # Tier 3 ($0.03 price): 10% budget -> shares = (0.10 * self.round_budget) / 0.030
-                tiers = [
-                    {"price": 0.010, "target_shares": (0.60 * self.round_budget) / 0.010},
-                    {"price": 0.020, "target_shares": (0.30 * self.round_budget) / 0.020},
-                    {"price": 0.030, "target_shares": (0.10 * self.round_budget) / 0.030}
-                ]
+                # Evaluate historical L2 order book ask depth <= $0.03 during final 5-second window
+                penny_trades = round_trades[round_trades['price'] <= 0.03].sort_values(by='price')
                 
+                budget_rem = self.round_budget
                 round_cost = 0.0
                 round_shares = 0.0
                 round_pnl = 0.0
                 executions_in_round = 0
                 
-                # Evaluate UP (YES) outcome limit order fills strictly constrained by Parquet trade depth volume
-                for tier in tiers:
-                    p_lim = tier["price"]
-                    target_sh = tier["target_shares"]
-                    matching = yes_trades[yes_trades['price'] <= p_lim]
-                    if len(matching) > 0:
-                        avail_vol = float(matching['size'].sum())
-                        filled_sh = min(target_sh, avail_vol)
-                        if filled_sh > 0:
-                            cost = filled_sh * p_lim
+                if len(penny_trades) > 0:
+                    for idx, tr in penny_trades.iterrows():
+                        p = float(tr['price'])
+                        vol = float(tr['size'])
+                        if p > 0.03 or p <= 0.0:
+                            continue
+                        token_is_yes = (tr['asset_id'] == yes_token)
+                        token_outcome = "Up" if token_is_yes else "Down"
+                        
+                        max_sh = budget_rem / p
+                        take_sh = min(vol, max_sh)
+                        if take_sh > 0:
+                            cost = take_sh * p
                             round_cost += cost
-                            round_shares += filled_sh
+                            round_shares += take_sh
                             executions_in_round += 1
+                            budget_rem -= cost
                             
-                            pnl = (filled_sh * 1.00 - cost) if up_won else -cost
+                            is_win = (token_outcome == winner)
+                            pnl = (take_sh * 1.00 - cost) if is_win else -cost
                             round_pnl += pnl
-                            if up_won:
+                            if is_win:
                                 wins += 1
-                                gross_revenue += (filled_sh * 1.00)
+                                gross_revenue += (take_sh * 1.00)
                             else:
                                 losses += 1
+                            if budget_rem <= 0.001:
+                                break
                                 
-                # Evaluate DOWN (NO) outcome limit order fills strictly constrained by Parquet trade depth volume
-                for tier in tiers:
-                    p_lim = tier["price"]
-                    target_sh = tier["target_shares"]
-                    matching = no_trades[no_trades['price'] <= p_lim]
-                    if len(matching) > 0:
-                        avail_vol = float(matching['size'].sum())
-                        filled_sh = min(target_sh, avail_vol)
-                        if filled_sh > 0:
-                            cost = filled_sh * p_lim
-                            round_cost += cost
-                            round_shares += filled_sh
-                            executions_in_round += 1
-                            
-                            pnl = (filled_sh * 1.00 - cost) if down_won else -cost
-                            round_pnl += pnl
-                            if down_won:
-                                wins += 1
-                                gross_revenue += (filled_sh * 1.00)
-                            else:
-                                losses += 1
-                                
-                if round_cost > 0.0:
+                if round_cost > 0.0 and round_shares > 0.0:
+                    avg_price = round_cost / round_shares
                     total_executions += executions_in_round
                     equity += round_pnl
                     unique_rounds_entered += 1
                     
                     if len(logs) < 200:
                         logs.append(
-                            f"[TRADE] Rd {total_rounds} {sym} @ Strike ${strike:,.2f}: Proven fill of {round_shares:,.0f} shares "
-                            f"(Cost: ${round_cost:.2f} USDC). Outcome: {winner} won -> PnL: {round_pnl:+.2f} USDC. Wallet: ${equity:,.2f}"
+                            f"[TRADE] Rd {total_rounds} {sym} @ Strike ${strike:,.2f}: Swept {round_shares:,.2f} shares @ avg ${avg_price:.3f} "
+                            f"({avg_price*100:.1f}¢) | Cost: ${round_cost:.2f} USDC | Outcome: {winner} won -> PnL: {round_pnl:+.2f} USDC. Wallet: ${equity:,.2f}"
                         )
                 else:
                     if len(logs) < 200:
                         logs.append(
-                            f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: Passive resting buy limit orders on BOTH sides "
-                            f"expired unfilled ($0.00 USDC cost change)."
+                            f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: No resting asks <= 3¢ on L2 book during final 5s window ($0.00 USDC cost change)."
                         )
                         
                 equity_timeline.append({"time": total_rounds, "equity": equity})
