@@ -404,7 +404,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.0.0"
+            "version": "2.0.1"
         }
 
     async def broadcast(self):
@@ -425,6 +425,8 @@ class TradingEngine:
         self.clients.add(websocket)
         self.add_system_log(f"Frontend client connected. Total clients: {len(self.clients)}")
         try:
+            # Send initial engine state immediately on connection open
+            await websocket.send(json.dumps(self.get_state()))
             async for message in websocket:
                 # Receive commands from frontend
                 data = json.loads(message)
@@ -1378,23 +1380,33 @@ class TradingEngine:
         """Serves production built static React files from dist/ directory.
         Handles both old websockets (path, headers) and new websockets (connection, request) signatures.
         """
+        headers = None
+        path = "/"
+        
         if hasattr(arg2, "headers") and hasattr(arg2, "path"):
             path = arg2.path
             headers = arg2.headers
-        else:
+        elif isinstance(arg1, str):
             path = arg1
             headers = arg2
-            
+        elif hasattr(arg1, "headers"):
+            headers = arg1.headers
+            if hasattr(arg1, "path"):
+                path = arg1.path
+                
         is_websocket = False
         if headers is not None:
             try:
-                upgrade = headers.get("Upgrade", "")
-                if upgrade.lower() == "websocket":
+                up = str(headers.get("Upgrade", "") or headers.get("upgrade", "")).lower()
+                conn = str(headers.get("Connection", "") or headers.get("connection", "")).lower()
+                if "websocket" in up or "upgrade" in conn:
                     is_websocket = True
             except Exception:
                 try:
                     for k, v in headers:
-                        if k.lower() == "upgrade" and v.lower() == "websocket":
+                        k_str = str(k).lower()
+                        v_str = str(v).lower()
+                        if (k_str == "upgrade" and "websocket" in v_str) or (k_str == "connection" and "upgrade" in v_str):
                             is_websocket = True
                             break
                 except Exception:
