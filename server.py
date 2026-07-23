@@ -5,6 +5,7 @@ import time
 import ssl
 import sys
 import os
+import re
 import urllib.request
 import http
 from datetime import datetime, timezone, timedelta
@@ -574,7 +575,6 @@ class TradingEngine:
                             last_tick_time = time.time()
                         except asyncio.TimeoutError:
                             if time.time() - last_tick_time >= 2.0:
-                                self.add_system_log("[PYTH HERMES] WS tick silent > 2s. Triggering instant Pyth REST fallback...")
                                 await self.fetch_pyth_rest_fallback()
                             continue
                             
@@ -668,104 +668,72 @@ class TradingEngine:
             await asyncio.sleep(60)
 
     async def sync_polymarket_gamma_api(self):
-        """Discovers active and upcoming 5M crypto contracts via dual-stage lookup on Polymarket Gamma API."""
+        """Discovers active and upcoming 5M crypto contracts via /events?slug= and /markets/slug/ endpoints."""
         ctx = ssl._create_unverified_context()
         while True:
             try:
                 t_now = int(time.time() + self.clob_clock_offset)
                 current_epoch = (t_now // 300) * 300
-                epochs_to_check = [current_epoch - 300, current_epoch, current_epoch + 300]
+                next_epoch = current_epoch + 300
                 
-                # STAGE 1: Broad discovery across open active events and markets
-                stage1_urls = [
-                    "https://gamma-api.polymarket.com/events?closed=false&limit=50",
-                    "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100"
-                ]
-                
-                for s_url in stage1_urls:
-                    try:
-                        req = urllib.request.Request(s_url, headers={'User-Agent': 'Mozilla/5.0'})
-                        res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=3, context=ctx)
-                        data = json.loads(res.read().decode())
-                        items = data if isinstance(data, list) else [data]
-                        
-                        for item in items:
-                            markets = item.get("markets", [item]) if isinstance(item, dict) else []
-                            for m in markets:
-                                if not isinstance(m, dict):
-                                    continue
-                                slug = m.get("slug", "") or m.get("eventSlug", "")
-                                if "-updown-5m-" in slug:
-                                    if slug not in self.active_markets or self.active_markets[slug].get("resolved"):
-                                        question = m.get("question", "") or m.get("title", "")
-                                        match = re.search(r"\$(\d+(?:\.\d+)?)", question)
-                                        sym_match = re.search(r"^(btc|eth|sol|xrp)", slug, re.IGNORECASE)
-                                        symbol = sym_match.group(1).upper() if sym_match else "BTC"
-                                        strike = float(match.group(1).replace(",", "")) if match else self.spot_prices.get(symbol, 0.0)
-                                        
-                                        tokens_raw = m.get("clobTokenIds", "[]")
-                                        tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
-                                        condition_id = m.get("conditionId")
-                                        
-                                        match_epoch = re.search(r"-(\d+)$", slug)
-                                        epoch_start = int(match_epoch.group(1)) if match_epoch else current_epoch
-                                        
-                                        self.active_markets[slug] = {
-                                            "slug": slug,
-                                            "symbol": symbol,
-                                            "strike_price": strike,
-                                            "epoch_start": epoch_start,
-                                            "close_time": epoch_start + 300,
-                                            "tokens": tokens,
-                                            "conditionId": condition_id,
-                                            "resolved": False,
-                                            "price_yes": 0.50,
-                                            "price_no": 0.50
-                                        }
-                                        asyncio.create_task(self.place_resting_orders_both_sides(self.active_markets[slug]))
-                                        self.add_system_log(f"[MARKET DISCOVERY] Broad discovery found 5M market: {slug} @ Strike ${strike:,.2f}")
-                    except Exception:
-                        pass
-
-                # STAGE 2: Fallback target epoch slug queries (epoch - 300, epoch, epoch + 300)
-                for target_epoch in epochs_to_check:
+                for target_epoch in [current_epoch, next_epoch]:
                     for sym in ["btc", "eth", "sol", "xrp"]:
                         slug = f"{sym}-updown-5m-{target_epoch}"
                         if slug in self.active_markets and not self.active_markets[slug].get("resolved"):
                             continue
                             
-                        url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
-                        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                        try:
-                            res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=3, context=ctx)
-                            data = json.loads(res.read().decode())
-                            if data and isinstance(data, list) and len(data) > 0:
-                                m = data[0]
-                                question = m.get("question", "") or m.get("title", "")
-                                match = re.search(r"\$(\d+(?:\.\d+)?)", question)
-                                symbol = sym.upper()
-                                strike = float(match.group(1).replace(",", "")) if match else self.spot_prices.get(symbol, 0.0)
+                        # Direct endpoints: /events?slug= and /markets/slug/
+                        urls = [
+                            f"https://gamma-api.polymarket.com/events?slug={slug}",
+                            f"https://gamma-api.polymarket.com/markets/slug/{slug}"
+                        ]
+                        
+                        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'}
+                        m_data = None
+                        for url in urls:
+                            req = urllib.request.Request(url, headers=headers)
+                            try:
+                                res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=3, context=ctx)
+                                data = json.loads(res.read().decode())
+                                if data:
+                                    if isinstance(data, list) and len(data) > 0:
+                                        evt = data[0]
+                                        mkts = evt.get("markets", [evt])
+                                        if mkts and isinstance(mkts[0], dict):
+                                            m_data = mkts[0]
+                                            m_data["_title_fallback"] = evt.get("title", "") or evt.get("question", "")
+                                            break
+                                    elif isinstance(data, dict):
+                                        m_data = data
+                                        break
+                            except Exception:
+                                pass
                                 
-                                tokens_raw = m.get("clobTokenIds", "[]")
-                                tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
-                                condition_id = m.get("conditionId")
-                                
-                                self.active_markets[slug] = {
-                                    "slug": slug,
-                                    "symbol": symbol,
-                                    "strike_price": strike,
-                                    "epoch_start": target_epoch,
-                                    "close_time": target_epoch + 300,
-                                    "tokens": tokens,
-                                    "conditionId": condition_id,
-                                    "resolved": False,
-                                    "price_yes": 0.50,
-                                    "price_no": 0.50
-                                }
-                                asyncio.create_task(self.place_resting_orders_both_sides(self.active_markets[slug]))
-                                self.add_system_log(f"[MARKET DISCOVERY] Direct epoch discovery: {slug} @ Strike ${strike:,.2f}")
-                        except Exception:
-                            pass
+                        if m_data and isinstance(m_data, dict):
+                            question = m_data.get("question", "") or m_data.get("title", "") or m_data.get("_title_fallback", "")
+                            match = re.search(r"\$(\d+(?:\.\d+)?)", question)
+                            symbol = sym.upper()
+                            strike = float(match.group(1).replace(",", "")) if match else self.spot_prices.get(symbol, 0.0)
+                            
+                            tokens_raw = m_data.get("clobTokenIds", "[]")
+                            tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
+                            condition_id = m_data.get("conditionId")
+                            
+                            self.active_markets[slug] = {
+                                "slug": slug,
+                                "symbol": symbol,
+                                "strike_price": strike,
+                                "epoch_start": target_epoch,
+                                "close_time": target_epoch + 300,
+                                "tokens": tokens,
+                                "conditionId": condition_id,
+                                "resolved": False,
+                                "price_yes": 0.50,
+                                "price_no": 0.50
+                            }
+                            # Post boundary resting maker limit buy orders across all 4 active pairs upon discovery
+                            asyncio.create_task(self.place_resting_orders_both_sides(self.active_markets[slug]))
+                            self.add_system_log(f"[MARKET DISCOVERY] Active 5M market discovered: {slug} @ Strike ${strike:,.2f}")
             except Exception as e:
                 self.add_system_log(f"[GAMMA_API_ERROR] Polymarket Gamma API market discovery failed: {e}")
                 
