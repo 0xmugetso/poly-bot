@@ -768,7 +768,7 @@ export default function App() {
                 <h1 className="text-base sm:text-lg font-bold tracking-widest text-[#F8FAFC]">
                   POLY-BOT <span className="text-[#10B981]">//</span> {activeTab === "live" ? "LIVE" : "SIM"}
                 </h1>
-                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.1.1</span>
+                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.1.2</span>
               </div>
               <span className="text-[9px] sm:text-[10px] uppercase font-mono tracking-wider text-slate-500">
                 Web3 Latency Arbitrage & Sweeper

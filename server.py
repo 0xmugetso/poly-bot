@@ -299,7 +299,8 @@ class TradingEngine:
         
         # Configuration
         self.max_slippage = 0.01
-        self.max_position_size_usdc = float(os.environ.get("MAX_POSITION_SIZE_USDC", 0.10))
+        self.max_order_size_usdc = 10.0
+        self.max_position_size_usdc = float(os.environ.get("MAX_POSITION_SIZE_USDC", 10.0))
         self.min_profit_threshold_usdc = float(os.environ.get("MIN_PROFIT_THRESHOLD_USDC", 0.02))
         self.env = os.environ.get("ENV", "SIMULATION")
         
@@ -456,7 +457,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.1.1"
+            "version": "2.1.2"
         }
 
     async def broadcast(self):
@@ -979,8 +980,9 @@ class TradingEngine:
             )
             return
 
-        # 4. Execute Sweep up to max round budget
-        budget_remaining = self.max_order_size_usdc
+        # 4. Execute Sweep up to 5% dynamic risk cap (max $10.00 for $200 wallet)
+        max_round_budget = min(10.0, max(1.0, 0.05 * self.wallet))
+        budget_remaining = max_round_budget
         total_acquired_shares = 0.0
         total_cost_usdc = 0.0
 
