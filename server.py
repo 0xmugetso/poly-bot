@@ -468,7 +468,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.1.3"
+            "version": "2.1.4"
         }
 
     async def broadcast(self):
@@ -1106,86 +1106,120 @@ class TradingEngine:
             self.add_system_log(f"[WARNING] Oracle resolution check failed for {slug} (conditionId: {condition_id}): {e}")
         return None
 
-    async def poll_and_resolve_market(self, slug, strike, condition_id=None):
-        """Asynchronously polls the Polymarket Gamma API until resolved, then settles trades."""
+    async def settle_trades_for_market(self, slug, winner):
+        """Settles all in-memory and database trades for a given market slug and winner, and broadcasts state to UI."""
+        resolved_any = False
+        resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        # 1. Settle in-memory activity_log trades
+        for trade in list(self.activity_log):
+            if trade.get("slug") == slug and trade.get("status") in ["PENDING", "FILLED"]:
+                resolved_any = True
+                is_win = (trade["outcome"] == winner)
+                cost = trade["size"] * trade["price"]
+                if is_win:
+                    trade["status"] = "WIN"
+                    trade["reason"] = f"Target outcome resolved successfully: {trade['outcome']} won at close"
+                    self.wins += 1
+                    if "Arbitrage" in trade.get("strategy", ""):
+                        self.arbitrage_wins += 1
+                    else:
+                        self.penny_wins += 1
+                    payout = trade["size"] * 1.0
+                    self.wallet += payout
+                    self.net_pnl_usdc += (payout - cost)
+                else:
+                    trade["status"] = "LOSS"
+                    trade["reason"] = f"Target outcome expired worthless: opposite outcome won at close"
+                    self.losses += 1
+                    self.net_pnl_usdc -= cost
+                
+                self.resolved_trades_count += 1
+                self.net_pnl_pct = (self.net_pnl_usdc / self.initial_wallet) * 100
+                self.add_system_log(f"[ORACLE] Round Settled: {slug} | Winner: {winner} | Trade: {trade['status']}")
+                self.db.resolve_trade(trade["tx_hash"], trade["status"], resolved_time)
+
+        # 2. Query DB to settle any filled trades that fell out of activity_log memory queue
+        cursor = self.db.execute(
+            "SELECT id, outcome_bet, entry_price, position_size, strategy FROM trades WHERE market_slug = ? AND pnl_status IN ('PENDING', 'FILLED')",
+            (slug,)
+        )
+        if cursor:
+            rows = cursor.fetchall()
+            for r in rows:
+                resolved_any = True
+                tx_id = r[0]
+                out_bet = r[1]
+                e_price = float(r[2]) if r[2] is not None else 0.0
+                pos_size = float(r[3]) if r[3] is not None else 0.0
+                strat = r[4] or ""
+                cost = pos_size * e_price
+                is_win = (out_bet == winner)
+                st = "WIN" if is_win else "LOSS"
+                if is_win:
+                    self.wins += 1
+                    if "Arbitrage" in strat:
+                        self.arbitrage_wins += 1
+                    else:
+                        self.penny_wins += 1
+                    payout = pos_size * 1.0
+                    self.wallet += payout
+                    self.net_pnl_usdc += (payout - cost)
+                else:
+                    self.losses += 1
+                    self.net_pnl_usdc -= cost
+                self.resolved_trades_count += 1
+                self.net_pnl_pct = (self.net_pnl_usdc / self.initial_wallet) * 100
+                self.db.resolve_trade(tx_id, st, resolved_time)
+                self.add_system_log(f"[ORACLE] DB Trade Settled: {slug} | Winner: {winner} | Trade: {st}")
+        
+        if resolved_any:
+            self.add_system_log(f"[ORACLE] Cleaned up resolved contract state for: {slug}")
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            win_rate = (self.wins / (self.wins + self.losses) * 100) if (self.wins + self.losses) > 0 else 0.0
+            self.db.save_daily_stats(today_str, self.wallet, self.wins + self.losses, win_rate, now_str)
+            await self.broadcast()
+
+    async def poll_and_resolve_market(self, slug, strike=0.0, condition_id=None):
+        """Asynchronously polls the Polymarket Gamma API for up to 10 minutes with exponential backoff until resolved."""
         self.add_system_log(f"[ORACLE] Started settlement resolution polling task for: {slug} (conditionId: {condition_id})")
+        start_t = time.time()
         retry_delay = 1.0
         
+        while time.time() - start_t < 600.0:
+            try:
+                winner = await self.resolve_market_via_oracle(slug, condition_id)
+                if winner:
+                    await self.settle_trades_for_market(slug, winner)
+                    return
+            except Exception as e:
+                self.add_system_log(f"[WARNING] Oracle polling error for {slug}: {e}")
+                
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(15.0, retry_delay * 1.5)
+            
+        self.add_system_log(f"[WARNING] Oracle polling timed out after 10m for {slug}. Orphaned reconciler will handle settlement.")
+
+    async def reconcile_orphaned_trades_loop(self):
+        """Background worker that continuously queries for stuck/orphaned trades older than 5m and settles them via Oracle."""
+        self.add_system_log("[RECONCILER] Orphaned Trade Reconciliation worker started (running every 30s).")
         while True:
-            winner = await self.resolve_market_via_oracle(slug, condition_id)
-            if winner:
-                resolved_any = False
-                resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-                # 1. Settle in-memory activity_log trades
-                for trade in list(self.activity_log):
-                    if trade.get("slug") == slug and trade.get("status") in ["PENDING", "FILLED"]:
-                        resolved_any = True
-                        is_win = (trade["outcome"] == winner)
-                        cost = trade["size"] * trade["price"]
-                        if is_win:
-                            trade["status"] = "WIN"
-                            trade["reason"] = f"Target outcome resolved successfully: {trade['outcome']} won at close"
-                            self.wins += 1
-                            if "Arbitrage" in trade.get("strategy", ""):
-                                self.arbitrage_wins += 1
-                            else:
-                                self.penny_wins += 1
-                            payout = trade["size"] * 1.0
-                            self.wallet += payout
-                            self.net_pnl_usdc += (payout - cost)
-                        else:
-                            trade["status"] = "LOSS"
-                            trade["reason"] = f"Target outcome expired worthless: opposite outcome won at close"
-                            self.losses += 1
-                            self.net_pnl_usdc -= cost
-                        
-                        self.resolved_trades_count += 1
-                        self.net_pnl_pct = (self.net_pnl_usdc / self.initial_wallet) * 100
-                        self.add_system_log(f"[ORACLE] Round Settled: {slug} | Winner: {winner} | Trade: {trade['status']}")
-                        self.db.resolve_trade(trade["tx_hash"], trade["status"], resolved_time)
-
-                # 2. Query SQLite DB to settle any filled trades that fell out of activity_log memory queue
-                cursor = self.db.execute("SELECT id, outcome_bet, entry_price, position_size, strategy FROM trades WHERE market_slug = ? AND pnl_status IN ('PENDING', 'FILLED')", (slug,))
+            try:
+                cursor = self.db.execute(
+                    "SELECT DISTINCT market_slug FROM trades WHERE pnl_status IN ('PENDING', 'FILLED')"
+                )
                 if cursor:
                     rows = cursor.fetchall()
                     for r in rows:
-                        resolved_any = True
-                        tx_id = r[0]
-                        out_bet = r[1]
-                        e_price = float(r[2]) if r[2] is not None else 0.0
-                        pos_size = float(r[3]) if r[3] is not None else 0.0
-                        strat = r[4] or ""
-                        cost = pos_size * e_price
-                        is_win = (out_bet == winner)
-                        st = "WIN" if is_win else "LOSS"
-                        if is_win:
-                            self.wins += 1
-                            if "Arbitrage" in strat:
-                                self.arbitrage_wins += 1
-                            else:
-                                self.penny_wins += 1
-                            payout = pos_size * 1.0
-                            self.wallet += payout
-                            self.net_pnl_usdc += (payout - cost)
-                        else:
-                            self.losses += 1
-                            self.net_pnl_usdc -= cost
-                        self.resolved_trades_count += 1
-                        self.db.resolve_trade(tx_id, st, resolved_time)
-                        self.add_system_log(f"[ORACLE] DB Trade Settled: {slug} | Winner: {winner} | Trade: {st}")
-                
-                if resolved_any:
-                    self.add_system_log(f"[ORACLE] Cleaned up resolved contract state for: {slug}")
-                    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-                    win_rate = (self.wins / (self.wins + self.losses) * 100) if (self.wins + self.losses) > 0 else 0.0
-                    self.db.save_daily_stats(today_str, self.wallet, self.wins + self.losses, win_rate, now_str)
-                    await self.broadcast()
-                return
-                
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(10.0, retry_delay + 1.0)
+                        slug = r[0]
+                        if slug:
+                            winner = await self.resolve_market_via_oracle(slug)
+                            if winner:
+                                await self.settle_trades_for_market(slug, winner)
+            except Exception as e:
+                self.add_system_log(f"[WARNING] Error in orphaned trade reconciler loop: {e}")
+            await asyncio.sleep(30.0)
 
     async def place_resting_orders_both_sides(self, market):
         """Places passive resting maker limit buy orders on BOTH sides (Up and Down) simultaneously using EGIG scaling."""
@@ -1840,6 +1874,7 @@ async def main():
     engine.supervise_task("Market Management Loop", engine.market_management_loop)
     engine.supervise_task("Rolling Prices Update", engine.rolling_prices_update_loop)
     engine.supervise_task("CLOB Clock Sync", engine.sync_clob_clock)
+    engine.supervise_task("Orphaned Trade Reconciler", engine.reconcile_orphaned_trades_loop)
     
     # Run an initial export on startup to verify setup
     date_str = datetime.now(timezone.utc).strftime("%Y_%m_%d")
