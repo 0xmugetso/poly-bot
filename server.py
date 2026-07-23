@@ -158,8 +158,12 @@ class DatabaseManager:
         
         try:
             cursor = self.conn.cursor()
+            if self.is_postgres and "?" in query:
+                query = query.replace("?", "%s")
             cursor.execute(query, params or ())
             if not self.is_postgres:
+                self.conn.commit()
+            else:
                 self.conn.commit()
             return cursor
         except Exception as e:
@@ -417,7 +421,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.0.9"
+            "version": "2.1.0"
         }
 
     async def broadcast(self):
