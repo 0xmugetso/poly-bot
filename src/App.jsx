@@ -768,7 +768,7 @@ export default function App() {
                 <h1 className="text-base sm:text-lg font-bold tracking-widest text-[#F8FAFC]">
                   POLY-BOT <span className="text-[#10B981]">//</span> {activeTab === "live" ? "LIVE" : "SIM"}
                 </h1>
-                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.1.2</span>
+                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.1.3</span>
               </div>
               <span className="text-[9px] sm:text-[10px] uppercase font-mono tracking-wider text-slate-500">
                 Web3 Latency Arbitrage & Sweeper
@@ -1230,6 +1230,25 @@ export default function App() {
                     }`}
                   >
                     {isPausedStream ? 'Resume' : 'Pause'}
+                  </button>
+                  <button 
+                    onClick={() => {
+                      const last100 = systemLogs.slice(-100);
+                      const content = last100.join("\n") + "\n";
+                      const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement("a");
+                      a.href = url;
+                      a.download = "poly_bot_process_monitor_last100_logs.txt";
+                      document.body.appendChild(a);
+                      a.click();
+                      document.body.removeChild(a);
+                      URL.revokeObjectURL(url);
+                    }}
+                    className="px-2 py-1 rounded border border-[#10B981]/40 bg-[#10B981]/10 text-[#10B981] hover:bg-[#10B981]/20 text-[10px] font-mono transition-colors flex items-center gap-1"
+                    title="Export last 100 System Process Monitor logs to .txt file"
+                  >
+                    <Download size={10} /> Export TXT
                   </button>
                 </div>
               </div>

@@ -432,6 +432,17 @@ class TradingEngine:
         self.system_logs.append(log_line)
         print(log_line)
 
+    def export_process_logs_txt(self, filename="process_monitor_last100_logs.txt", max_logs=100):
+        """Exports the last 100 System Process Monitor logs to a TXT file with one log per line."""
+        try:
+            logs_list = list(self.system_logs)[-max_logs:]
+            txt_content = "\n".join(logs_list) + "\n"
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(txt_content)
+            return txt_content, filename
+        except Exception as e:
+            return f"Error exporting process logs: {e}\n", filename
+
     def get_state(self):
         # Build state dict to stream to frontend
         return {
@@ -457,7 +468,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.1.2"
+            "version": "2.1.3"
         }
 
     async def broadcast(self):
@@ -1623,6 +1634,15 @@ class TradingEngine:
                     
         if is_websocket:
             return None # Proceed to websocket handler
+
+        if path in ["/api/export-logs-txt", "/api/export-process-logs"] or path.startswith("/api/export-logs-txt"):
+            txt_content, filename = self.engine.export_process_logs_txt()
+            headers = [
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Disposition", f"attachment; filename={filename}"),
+                ("Access-Control-Allow-Origin", "*")
+            ]
+            return http.HTTPStatus.OK, headers, txt_content.encode("utf-8")
 
         if path == "/api/export-logs" or path.startswith("/api/export-logs"):
             csv_content, filename = self.generate_csv_string()
