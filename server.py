@@ -131,8 +131,8 @@ class DatabaseManager:
                                   ("strike_price", "DECIMAL(12, 4)"),
                                   ("trigger_spot_price", "DECIMAL(12, 4)"),
                                   ("time_delta_seconds", "DECIMAL(10, 4)"),
-                                  ("block_reason", "VARCHAR(128)"),
-                                  ("rejection_reason", "VARCHAR(255) DEFAULT 'NONE'"),
+                                  ("block_reason", "TEXT"),
+                                  ("rejection_reason", "TEXT"),
                                   ("spot_strike_delta", "NUMERIC DEFAULT 0.0"),
                                   ("parent_order_id", "VARCHAR(255) DEFAULT NULL")]:
                 try:
@@ -141,6 +141,18 @@ class DatabaseManager:
                         self.conn.commit()
                 except Exception:
                     pass # column already exists
+                    
+            if self.is_postgres:
+                for alt_sql in [
+                    "ALTER TABLE trades ALTER COLUMN rejection_reason TYPE TEXT;",
+                    "ALTER TABLE trades ALTER COLUMN block_reason TYPE TEXT;",
+                    "ALTER TABLE trades ALTER COLUMN market_slug TYPE VARCHAR(255);",
+                    "ALTER TABLE trades ALTER COLUMN parent_order_id TYPE VARCHAR(255);"
+                ]:
+                    try:
+                        cursor.execute(alt_sql)
+                    except Exception:
+                        pass
             
             # Mainnet Purge: Clean up mock records on launch under production mode
             if os.environ.get("ENV") == "LIVE_MAINNET_TRADING":
@@ -174,6 +186,11 @@ class DatabaseManager:
                      execution_mode="MAKER_LIMIT", strike_price=None, trigger_spot_price=None,
                      time_delta_seconds=None, block_reason=None, rejection_reason=None, spot_strike_delta=None, parent_order_id=None):
         try:
+            slug = str(slug or "")[:255]
+            block_reason = str(block_reason or "")[:255]
+            rejection_reason = str(rejection_reason or "")[:255]
+            parent_order_id = str(parent_order_id or "")[:255] if parent_order_id else None
+
             query = """
             INSERT INTO trades (id, timestamp_utc, market_slug, strategy, outcome_bet, entry_price, position_size, gas_fee_gwei, pnl_status, resolved_at,
                                 execution_mode, strike_price, trigger_spot_price, time_delta_seconds, block_reason, rejection_reason, spot_strike_delta, parent_order_id)
@@ -268,8 +285,8 @@ import sqlite3
 
 class TradingEngine:
     def __init__(self):
-        # Wallet and performance stats
-        self.initial_wallet = 1420.55
+        # Wallet and performance stats (Baseline: $200.00 USDC)
+        self.initial_wallet = 200.0
         self.wallet = self.initial_wallet
         self.net_pnl_usdc = 0.0
         self.net_pnl_pct = 0.0
@@ -315,12 +332,30 @@ class TradingEngine:
         
         self.add_system_log("POLY-BOT trading engine initialized.")
         
-        # Database Integration
+        # Database Integration and Fresh Baseline Reset
         self.db = DatabaseManager(self.add_system_log)
+        self.db.execute("DELETE FROM trades;")
+        self.db.execute("DELETE FROM daily_stats;")
+        self.add_system_log("Fresh state reset: Database purged. Baseline set to $200.00 USDC.")
         self.rehydrate_state()
 
     def rehydrate_state(self):
         recent_trades = self.db.load_recent_trades(50)
+        if not recent_trades:
+            self.initial_wallet = 200.0
+            self.wallet = 200.0
+            self.wins = 0
+            self.losses = 0
+            self.arbitrage_wins = 0
+            self.penny_wins = 0
+            self.total_trades_count = 0
+            self.resolved_trades_count = 0
+            self.net_pnl_usdc = 0.0
+            self.net_pnl_pct = 0.0
+            self.activity_log.clear()
+            self.add_system_log(f"Clean state rehydrated. Current Wallet Balance: ${self.wallet:.2f} USDC | Wins: 0 | Losses: 0")
+            return
+            
         self.add_system_log(f"Rehydrating state: loaded {len(recent_trades)} historical trades from database.")
         
         for t in recent_trades:
@@ -421,7 +456,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.1.0"
+            "version": "2.1.1"
         }
 
     async def broadcast(self):

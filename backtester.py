@@ -109,7 +109,7 @@ def get_market_details_cached(slug):
     return None
 
 class Backtester:
-    def __init__(self, start_date=None, end_date=None, round_budget=10.0, start_balance=1000.0, base_size=None, **kwargs):
+    def __init__(self, start_date=None, end_date=None, round_budget=10.0, start_balance=200.0, base_size=None, **kwargs):
         self.start_date = start_date or "2026-07-14"
         self.end_date = end_date or "2026-07-14"
         self.round_budget = float(round_budget if round_budget is not None else (base_size or 10.0))
