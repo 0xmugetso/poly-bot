@@ -303,7 +303,7 @@ class Backtester:
                 down_won = not up_won
                 
                 window_start = epoch_start + 295
-                window_end = epoch_start + 305
+                window_end = epoch_start + 300
                 
                 round_trades = df[
                     (df['timestamp_sec'] >= window_start) & 

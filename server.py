@@ -417,7 +417,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.0.7"
+            "version": "2.0.8"
         }
 
     async def broadcast(self):
@@ -732,10 +732,9 @@ class TradingEngine:
                                 "conditionId": condition_id,
                                 "resolved": False,
                                 "price_yes": 0.50,
-                                "price_no": 0.50
+                                "price_no": 0.50,
+                                "orders_posted": False
                             }
-                            # Post boundary resting maker limit buy orders across all 4 active pairs upon discovery
-                            asyncio.create_task(self.place_resting_orders_both_sides(self.active_markets[slug]))
                             self.add_system_log(f"[MARKET DISCOVERY] Active 5M market discovered: {slug} @ Strike ${strike:,.2f}")
             except Exception as e:
                 self.add_system_log(f"[GAMMA_API_ERROR] Polymarket Gamma API market discovery failed: {e}")
@@ -783,45 +782,14 @@ class TradingEngine:
                         "conditionId": condition_id,
                         "resolved": False,
                         "price_yes": 0.50,
-                        "price_no": 0.50
+                        "price_no": 0.50,
+                        "orders_posted": False
                     }
-                    
-                    # Also post resting maker limit buy orders on BOTH sides upon market discovery
-                    asyncio.create_task(self.place_resting_orders_both_sides(self.active_markets[slug]))
             except Exception as e:
                 pass
 
     async def market_management_loop(self):
-        """Main engine execution loop evaluating active 5M markets."""
-        while True:
-            await self.fetch_active_polymarket_events()
-            t = time.time() + self.clob_clock_offset
-            
-            for slug, market in list(self.active_markets.items()):
-                if market.get("resolved"):
-                    continue
-                    
-                time_remaining = market["close_time"] - t
-                symbol = market["symbol"]
-                strike = market["strike_price"]
-                spot = self.spot_prices.get(symbol, strike)
-                
-                # Check for 0.5s boundary fence
-                fence_active = (time_remaining <= 0.5)
-                
-                # Dynamic spot vs strike diff
-                delta = spot - strike
-                
-                # Simulated order book YES/NO pricing derived from spot vs strike delta
-                volatility_factor = 2.0 if symbol in ["BTC", "BNB"] else 0.1
-                val = -delta / volatility_factor
-                val = max(-50.0, min(50.0, val))
-                price_yes = 1 / (1 + 2.718 ** val)
-                price_yes = max(0.01, min(0.99, price_yes))
-                price_no = 1 - price_yes
-                
-    async def market_management_loop(self):
-        """Main engine execution loop evaluating active 5M markets, fills, and epoch turnover."""
+        """Main engine execution loop evaluating active 5M markets, expiration-window order placement, fills, and epoch turnover."""
         while True:
             await self.fetch_active_polymarket_events()
             t = time.time() + self.clob_clock_offset
@@ -850,7 +818,13 @@ class TradingEngine:
                 market["price_yes"] = round(price_yes, 2)
                 market["price_no"] = round(price_no, 2)
                 
-                # WORKER 1: LIVE FILL WORKER (Evaluates resting orders during active round)
+                # Expiration Window Order Placement (Final 5.0s down to 0.6s before market close)
+                if time_remaining <= 5.0 and time_remaining >= 0.6 and not market.get("orders_posted"):
+                    market["orders_posted"] = True
+                    asyncio.create_task(self.place_resting_orders_both_sides(market))
+                    self.add_system_log(f"[EXPIRATION WINDOW] Deployed expiration boundary limit ladder for {slug} (T-{time_remaining:.1f}s remaining)")
+
+                # WORKER 1: LIVE FILL WORKER (Evaluates resting orders during active window)
                 if time_remaining > 0 and t < market["close_time"]:
                     for order in list(self.resting_limit_orders):
                         if order["slug"] == slug:
@@ -874,10 +848,10 @@ class TradingEngine:
                                     
                                     if matched_trade:
                                         matched_trade["status"] = "FILLED"
-                                        matched_trade["reason"] = "Resting limit order filled by market taker"
+                                        matched_trade["reason"] = "Resting limit order filled by market taker in expiration window"
                                         self.db.resolve_trade(order["tx_hash"], "FILLED", None)
                                     else:
-                                        trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "FILLED", order["tx_hash"], reason="Resting limit order filled by market taker")
+                                        trade = self.add_activity(slug, order["outcome"], order["price"], order["size"], "FILLED", order["tx_hash"], reason="Resting limit order filled by market taker in expiration window")
                                         trade["strategy"] = order["strategy"]
                                         self.db.insert_trade(
                                             order["tx_hash"], 
@@ -898,11 +872,11 @@ class TradingEngine:
                                     self.add_system_log(f"[MAKER LIMIT FILLED] Limit order for {order['outcome']} filled on {slug} @ ${order['price']:.3f} (Cost: ${cost:.2f} USDC)")
                                 self.resting_limit_orders.remove(order)
 
-                # WORKER 2: EPOCH TURNOVER RESOLVER (Triggers when 5m epoch completes)
-                if time_remaining <= 0:
+                # WORKER 2: EPOCH TURNOVER RESOLVER (Triggers immediately when time_remaining <= 0.0)
+                if time_remaining <= 0.0:
                     resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
                     
-                    # A. Mark all unfilled resting orders in memory as EXPIRED_UNFILLED
+                    # A. Cancel all unfilled resting limit orders immediately at time_remaining <= 0.0
                     for order in list(self.resting_limit_orders):
                         if order["slug"] == slug:
                             self.resting_limit_orders.remove(order)
@@ -918,7 +892,7 @@ class TradingEngine:
                         (resolved_time, slug)
                     )
 
-                    # C. Trigger async Oracle settlement resolution task for FILLED/PENDING orders
+                    # C. Trigger async Oracle settlement resolution task for FILLED orders
                     condition_id = market.get("conditionId")
                     asyncio.create_task(self.poll_and_resolve_market(slug, strike, condition_id))
                     
@@ -928,7 +902,7 @@ class TradingEngine:
                         self.market_locks.pop(slug)
             
             await self.broadcast()
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)
 
     async def get_clob_order_status(self, order_id):
         """Queries the Polymarket CLOB GET /order/{order_id} endpoint for status."""
