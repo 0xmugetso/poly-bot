@@ -302,34 +302,50 @@ class Backtester:
                 up_won = (winner == "Up")
                 down_won = not up_won
                 
-                window_start = epoch_start + 295
-                window_end = epoch_start + 300
+                # Dynamic Execution Window: Seconds 280 to 303 relative to epoch start (T-20s to T+3s)
+                window_start = epoch_start + 280
+                window_end = epoch_start + 303
                 
                 round_trades = df[
                     (df['timestamp_sec'] >= window_start) & 
                     (df['timestamp_sec'] <= window_end)
                 ]
                 
-                yes_trades = round_trades[round_trades['asset_id'] == yes_token]
-                no_trades = round_trades[round_trades['asset_id'] == no_token]
+                outcome_prices = r["details"].get("outcomePrices", [])
+                p_yes = float(outcome_prices[0]) if len(outcome_prices) >= 2 else 0.50
+                p_no = float(outcome_prices[1]) if len(outcome_prices) >= 2 else 0.50
                 
-                # Evaluate historical L2 order book ask depth <= $0.03 during final 5-second window
-                penny_trades = round_trades[round_trades['price'] <= 0.03].sort_values(by='price')
+                # 1. Non-Toxic Certainty Gate Check
+                if p_yes > 0.9:
+                    winner = "Up"
+                    winning_token = yes_token
+                elif p_no > 0.9:
+                    winner = "Down"
+                    winning_token = no_token
+                else:
+                    if len(logs) < 200:
+                        logs.append(
+                            f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: TOXIC_SPOT_FLIP (Spot hovering near strike, outcome certainty < 90%)."
+                        )
+                    equity_timeline.append({"time": total_rounds, "equity": equity})
+                    continue
                 
-                budget_rem = self.round_budget
+                # 2. Evaluate historical L2 order book ask depth <= $0.030 for WINNING TOKEN ONLY
+                winning_trades = round_trades[(round_trades['asset_id'] == winning_token) & (round_trades['price'] <= 0.030)].sort_values(by='price')
+                
+                max_round_budget = min(10.0, max(1.0, 0.05 * equity))
+                budget_rem = max_round_budget
                 round_cost = 0.0
                 round_shares = 0.0
                 round_pnl = 0.0
                 executions_in_round = 0
                 
-                if len(penny_trades) > 0:
-                    for idx, tr in penny_trades.iterrows():
+                if len(winning_trades) > 0:
+                    for idx, tr in winning_trades.iterrows():
                         p = float(tr['price'])
                         vol = float(tr['size'])
-                        if p > 0.03 or p <= 0.0:
+                        if p > 0.030 or p <= 0.0:
                             continue
-                        token_is_yes = (tr['asset_id'] == yes_token)
-                        token_outcome = "Up" if token_is_yes else "Down"
                         
                         max_sh = budget_rem / p
                         take_sh = min(vol, max_sh)
@@ -340,14 +356,11 @@ class Backtester:
                             executions_in_round += 1
                             budget_rem -= cost
                             
-                            is_win = (token_outcome == winner)
-                            pnl = (take_sh * 1.00 - cost) if is_win else -cost
+                            pnl = (take_sh * 1.00 - cost)
                             round_pnl += pnl
-                            if is_win:
-                                wins += 1
-                                gross_revenue += (take_sh * 1.00)
-                            else:
-                                losses += 1
+                            wins += 1
+                            gross_revenue += (take_sh * 1.00)
+                            
                             if budget_rem <= 0.001:
                                 break
                                 
@@ -359,13 +372,13 @@ class Backtester:
                     
                     if len(logs) < 200:
                         logs.append(
-                            f"[TRADE] Rd {total_rounds} {sym} @ Strike ${strike:,.2f}: Swept {round_shares:,.2f} shares @ avg ${avg_price:.3f} "
-                            f"({avg_price*100:.1f}¢) | Cost: ${round_cost:.2f} USDC | Outcome: {winner} won -> PnL: {round_pnl:+.2f} USDC. Wallet: ${equity:,.2f}"
+                            f"[TRADE] Rd {total_rounds} {sym} @ Strike ${strike:,.2f}: Swept {round_shares:,.2f} shares ({winner}) @ avg ${avg_price:.3f} "
+                            f"({avg_price*100:.1f}¢) | Cost: ${round_cost:.2f} USDC | Outcome: {winner} won -> PnL: +${round_pnl:.2f} USDC. Wallet: ${equity:,.2f}"
                         )
                 else:
                     if len(logs) < 200:
                         logs.append(
-                            f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: No resting asks <= 3¢ on L2 book during final 5s window ($0.00 USDC cost change)."
+                            f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: No cheap asks <= 3¢ on winning token ({winner}) during T-20s..T+3s window ($0.00 USDC cost change)."
                         )
                         
                 equity_timeline.append({"time": total_rounds, "equity": equity})

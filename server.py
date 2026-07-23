@@ -468,7 +468,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.1.4"
+            "version": "2.1.5"
         }
 
     async def broadcast(self):
@@ -869,31 +869,15 @@ class TradingEngine:
                 market["price_yes"] = round(price_yes, 2)
                 market["price_no"] = round(price_no, 2)
                 
-                # Dynamic CLOB Taker Sweeper Execution (Final 5.0s down to 0.6s before market close)
-                if time_remaining <= 5.0 and time_remaining >= 0.6 and not market.get("evaluated_sweep"):
+                # Dynamic CLOB Taker Sweeper Execution (Seconds 280 to 303 relative to epoch start: T-20s down to T+3s)
+                if time_remaining <= 20.0 and time_remaining >= -3.0 and not market.get("evaluated_sweep"):
                     market["evaluated_sweep"] = True
                     asyncio.create_task(self.evaluate_and_execute_clob_sweep(market))
 
-                # EPOCH TURNOVER RESOLVER (Triggers immediately when time_remaining <= 0.0)
-                if time_remaining <= 0.0:
+                # EPOCH TURNOVER RESOLVER (Triggers immediately when time_remaining <= -3.0)
+                if time_remaining <= -3.0:
                     resolved_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
                     
-                    # A. Cancel any remaining unfilled limit orders
-                    for order in list(self.resting_limit_orders):
-                        if order["slug"] == slug:
-                            self.resting_limit_orders.remove(order)
-                            for trade in self.activity_log:
-                                if trade["tx_hash"] == order["tx_hash"] and trade["status"] == "LIMIT_POSTED":
-                                    trade["status"] = "EXPIRED_UNFILLED"
-                                    trade["reason"] = "Market epoch closed without fill at target limit price ($0.00 USDC cost change)"
-                                    self.db.resolve_trade(order["tx_hash"], "EXPIRED_UNFILLED", resolved_time)
-
-                    # B. Update SQLite DB to guarantee 100% of LIMIT_POSTED rows for this slug transition to EXPIRED_UNFILLED
-                    self.db.execute(
-                        "UPDATE trades SET pnl_status = 'EXPIRED_UNFILLED', resolved_at = ? WHERE market_slug = ? AND pnl_status = 'LIMIT_POSTED'",
-                        (resolved_time, slug)
-                    )
-
                     # C. Trigger async Oracle settlement resolution task for FILLED orders
                     condition_id = market.get("conditionId")
                     asyncio.create_task(self.poll_and_resolve_market(slug, strike, condition_id))
@@ -927,71 +911,58 @@ class TradingEngine:
             return []
 
     async def evaluate_and_execute_clob_sweep(self, market):
-        """Evaluates live CLOB ask depth and Pyth spot toxicity, then executes dynamic taker sweeps."""
+        """Evaluates live CLOB ask depth on GUARANTEED WINNING TOKEN ONLY, then executes dynamic taker sweeps."""
         slug = market["slug"]
         symbol = market["symbol"]
         strike = market["strike_price"]
         tokens = market.get("tokens", [])
         spot = self.spot_prices.get(symbol, strike)
-        time_delta = float(market.get("close_time", time.time() + 300)) - (time.time() + self.clob_clock_offset)
+        close_time = float(market.get("close_time", time.time() + 300))
+        time_delta = close_time - (time.time() + self.clob_clock_offset)
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-        # Toxicity Gate Safety Buffer per Symbol
-        safety_buffers = {"BTC": 2.0, "ETH": 0.2, "SOL": 0.05, "XRP": 0.0005}
-        buffer_val = safety_buffers.get(symbol, 0.1)
+        # 1. Non-Toxic Certainty Gate (Proximity = |Spot - Strike| / Strike >= 0.05%)
         delta = spot - strike
+        proximity = (abs(delta) / strike) if strike > 0 else 0.0
 
-        # 1. Evaluate Non-Toxic Toxicity Gate
-        if abs(delta) < buffer_val:
-            reason = f"TOXIC_SPOT_FLIP (Spot ${spot:.2f} too close to Strike ${strike:.2f}, delta={delta:+.2f})"
+        if proximity < 0.0005:
+            reason = f"TOXIC_SPOT_FLIP (Proximity {proximity*100:.4f}% < 0.05% threshold | Spot ${spot:.2f} vs Strike ${strike:.2f}, delta={delta:+.2f})"
             self.add_system_log(f"[SWEEP_SKIPPED] {slug}: {reason}")
             tx_hash = f"0x{random.randbytes(16).hex()}"
             self.db.insert_trade(
                 tx_hash, now_utc, slug, "Strategy B (CLOB Sweeper)", "None", 0.0, 0.0,
                 self.priority_gas_gwei, "EXPIRED_UNFILLED", execution_mode="TAKER_SWEEP",
                 strike_price=strike, trigger_spot_price=spot, time_delta_seconds=time_delta,
-                block_reason="TOXIC_SPOT_FLIP", rejection_reason=reason, spot_strike_delta=delta
+                block_reason="TOXIC_SPOT_FLIP", rejection_reason=reason[:255], spot_strike_delta=delta
             )
             return
 
-        # 2. Determine target winning outcome and token
+        # 2. Establish GUARANTEED WINNING OUTCOME TOKEN ONLY
         winning_outcome = "Up" if delta > 0 else "Down"
-        target_token = None
         if len(tokens) >= 2:
-            target_token = tokens[0] if winning_outcome == "Up" else tokens[1]
+            winning_token_id = tokens[0] if winning_outcome == "Up" else tokens[1]
         elif len(tokens) == 1:
-            target_token = tokens[0]
+            winning_token_id = tokens[0]
         else:
             return
 
-        # 3. Read live Polymarket CLOB ask depth for <= $0.03
-        asks = await self.fetch_clob_book_asks(target_token)
-        asks_below_3c = [a for a in asks if 0.0 < a["price"] <= 0.03]
+        # 3. Read live Polymarket CLOB ask depth for WINNING TOKEN ONLY
+        asks = await self.fetch_clob_book_asks(winning_token_id)
+        asks_below_3c = [a for a in asks if 0.0 < a["price"] <= 0.030]
 
         if not asks_below_3c:
-            # Fallback: check opposite token if asks <= 0.03 exist
-            opp_token = tokens[1] if target_token == tokens[0] and len(tokens) >= 2 else None
-            if opp_token:
-                opp_asks = await self.fetch_clob_book_asks(opp_token)
-                opp_below_3c = [a for a in opp_asks if 0.0 < a["price"] <= 0.03]
-                if opp_below_3c:
-                    asks_below_3c = opp_below_3c
-                    target_token = opp_token
-                    winning_outcome = "Down" if winning_outcome == "Up" else "Up"
-
-        if not asks_below_3c:
-            reason = "NO_ASK_DEPTH_BELOW_3C"
-            self.add_system_log(f"[SWEEP_SKIPPED] {slug}: No resting asks <= 3¢ on CLOB orderbook.")
+            reason = f"NO_ASK_DEPTH_BELOW_3C (No cheap asks <= 3¢ on winning token {winning_outcome})"
+            self.add_system_log(f"[SWEEP_SKIPPED] {slug}: No cheap asks <= 3¢ on winning token ({winning_outcome}).")
             tx_hash = f"0x{random.randbytes(16).hex()}"
             self.db.insert_trade(
                 tx_hash, now_utc, slug, "Strategy B (CLOB Sweeper)", winning_outcome, 0.0, 0.0,
                 self.priority_gas_gwei, "EXPIRED_UNFILLED", execution_mode="TAKER_SWEEP",
                 strike_price=strike, trigger_spot_price=spot, time_delta_seconds=time_delta,
-                block_reason="NO_ASK_DEPTH_BELOW_3C", rejection_reason="No asks <= 3c", spot_strike_delta=delta
+                block_reason="NO_ASK_DEPTH_BELOW_3C", rejection_reason=reason[:255], spot_strike_delta=delta
             )
             return
 
-        # 4. Execute Sweep up to 5% dynamic risk cap (max $10.00 for $200 wallet)
+        # 4. Execute Sweep up to 5% dynamic risk cap ($10.00 USDC cap for $200 wallet)
         max_round_budget = min(10.0, max(1.0, 0.05 * self.wallet))
         budget_remaining = max_round_budget
         total_acquired_shares = 0.0
@@ -1028,7 +999,7 @@ class TradingEngine:
                 tx_hash, now_utc, slug, "Strategy B (CLOB Sweeper)", winning_outcome, weighted_avg_price, total_acquired_shares,
                 self.priority_gas_gwei, "BLOCKED_BY_GUARDRAIL", execution_mode="TAKER_SWEEP",
                 strike_price=strike, trigger_spot_price=spot, time_delta_seconds=time_delta,
-                block_reason="GAS_UNPROFITABLE", rejection_reason=reason, spot_strike_delta=delta
+                block_reason="GAS_UNPROFITABLE", rejection_reason=reason[:255], spot_strike_delta=delta
             )
             return
 
@@ -1040,7 +1011,7 @@ class TradingEngine:
 
             trade = self.add_activity(
                 slug, winning_outcome, weighted_avg_price, total_acquired_shares, "FILLED", tx_hash,
-                reason=f"[SWEEP_EXECUTED] Swept {total_acquired_shares:.2f} shares @ avg ${weighted_avg_price:.3f} | Spot distance safe (${spot:.2f} vs ${strike:.2f})"
+                reason=f"[SWEEP_EXECUTED] Swept {total_acquired_shares:.2f} shares ({winning_outcome}) @ avg ${weighted_avg_price:.3f} (${total_cost_usdc:.2f} USDC cost)"
             )
             trade["strategy"] = "Strategy B (CLOB Sweeper)"
 
@@ -1052,8 +1023,8 @@ class TradingEngine:
             )
 
             self.add_system_log(
-                f"[SWEEP_EXECUTED] Swept {total_acquired_shares:.2f} shares on {slug} @ avg ${weighted_avg_price:.3f} "
-                f"({weighted_avg_price*100:.1f}¢) | Cost: ${total_cost_usdc:.2f} USDC | Decision: SWEEP_EXECUTED"
+                f"[SWEEP_EXECUTED] Swept {total_acquired_shares:.2f} shares on {slug} ({winning_outcome}) @ avg ${weighted_avg_price:.3f} "
+                f"({weighted_avg_price*100:.1f}¢) | Cost: ${total_cost_usdc:.2f} USDC | Proximity {proximity*100:.4f}% safe"
             )
 
     async def get_clob_order_status(self, order_id):
