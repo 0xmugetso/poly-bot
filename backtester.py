@@ -109,14 +109,11 @@ def get_market_details_cached(slug):
     return None
 
 class Backtester:
-    def __init__(self, start_date=None, end_date=None, proximity_limit=0.0002, obi_cutoff=0.65, base_size=10.0, start_balance=1000.0, vol_multiplier=4.8):
+    def __init__(self, start_date=None, end_date=None, round_budget=10.0, start_balance=1000.0, base_size=None, **kwargs):
         self.start_date = start_date or "2026-07-14"
         self.end_date = end_date or "2026-07-14"
-        self.proximity_limit = float(proximity_limit)
-        self.obi_cutoff = float(obi_cutoff)
-        self.base_size = float(base_size)
+        self.round_budget = float(round_budget if round_budget is not None else (base_size or 10.0))
         self.start_balance = float(start_balance)
-        self.vol_multiplier = float(vol_multiplier)
         self.symbols = ["BTC", "ETH", "SOL", "XRP"]
 
     def run(self):
@@ -316,14 +313,14 @@ class Backtester:
                 yes_trades = round_trades[round_trades['asset_id'] == yes_token]
                 no_trades = round_trades[round_trades['asset_id'] == no_token]
                 
-                # EGIG Position Scaling Matrix Tiers:
-                # $0.01 Tier: Max Budget = $30.00 USDC -> 3,000 shares @ $0.01
-                # $0.02 Tier: Max Budget = $3.00 USDC -> 150 shares @ $0.02
-                # $0.03 Tier: Max Budget = $1.50 USDC -> 50 shares @ $0.03
+                # EGIG Dynamic Position Scaling Matrix Tiers based on self.round_budget (Default $10.00):
+                # Tier 1 ($0.01 price): 60% budget -> shares = (0.60 * self.round_budget) / 0.010
+                # Tier 2 ($0.02 price): 30% budget -> shares = (0.30 * self.round_budget) / 0.020
+                # Tier 3 ($0.03 price): 10% budget -> shares = (0.10 * self.round_budget) / 0.030
                 tiers = [
-                    {"price": 0.010, "target_shares": 3000.0},
-                    {"price": 0.020, "target_shares": 150.0},
-                    {"price": 0.030, "target_shares": 50.0}
+                    {"price": 0.010, "target_shares": (0.60 * self.round_budget) / 0.010},
+                    {"price": 0.020, "target_shares": (0.30 * self.round_budget) / 0.020},
+                    {"price": 0.030, "target_shares": (0.10 * self.round_budget) / 0.030}
                 ]
                 
                 round_cost = 0.0

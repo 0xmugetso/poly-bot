@@ -417,7 +417,7 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.0.5"
+            "version": "2.0.6"
         }
 
     async def broadcast(self):
@@ -674,13 +674,16 @@ class TradingEngine:
             try:
                 t_now = int(time.time() + self.clob_clock_offset)
                 current_epoch = (t_now // 300) * 300
-                next_epoch = current_epoch + 300
                 
-                for target_epoch in [current_epoch, next_epoch]:
-                    for sym in ["btc", "eth", "sol", "xrp"]:
-                        slug = f"{sym}-updown-5m-{target_epoch}"
-                        if slug in self.active_markets and not self.active_markets[slug].get("resolved"):
-                            continue
+                # Instantly purge any past/expired epochs to maintain strictly 4 active cards
+                for slug, m in list(self.active_markets.items()):
+                    if m.get("close_time", 0) <= t_now:
+                        self.active_markets.pop(slug, None)
+                
+                for sym in ["btc", "eth", "sol", "xrp"]:
+                    slug = f"{sym}-updown-5m-{current_epoch}"
+                    if slug in self.active_markets and not self.active_markets[slug].get("resolved"):
+                        continue
                             
                         # Direct endpoints: /events?slug= and /markets/slug/
                         urls = [
@@ -723,8 +726,8 @@ class TradingEngine:
                                 "slug": slug,
                                 "symbol": symbol,
                                 "strike_price": strike,
-                                "epoch_start": target_epoch,
-                                "close_time": target_epoch + 300,
+                                "epoch_start": current_epoch,
+                                "close_time": current_epoch + 300,
                                 "tokens": tokens,
                                 "conditionId": condition_id,
                                 "resolved": False,
@@ -1002,11 +1005,12 @@ class TradingEngine:
         parent_order_id_up = f"parent-up-{slug}"
         parent_order_id_down = f"parent-down-{slug}"
         
-        # EGIG Position Sizing Matrix: Favor $0.01 penny layers (+9,900% ROI payout asymmetry)
+        round_budget = getattr(self, "max_order_size_usdc", 10.0)
+        # Dynamic EGIG Position Sizing Matrix: 60% @ $0.01 (600 sh), 30% @ $0.02 (150 sh), 10% @ $0.03 (33 sh)
         levels = [
-            {"price": 0.010, "budget": 30.00}, # 3,000 shares @ $0.01
-            {"price": 0.020, "budget": 3.00},  # 150 shares @ $0.02
-            {"price": 0.030, "budget": 1.50}   # 50 shares @ $0.03
+            {"price": 0.010, "budget": 0.60 * round_budget},
+            {"price": 0.020, "budget": 0.30 * round_budget},
+            {"price": 0.030, "budget": 0.10 * round_budget}
         ]
         
         tasks = []

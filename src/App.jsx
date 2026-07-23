@@ -230,9 +230,7 @@ export default function App() {
   const [backtestParams, setBacktestParams] = useState({
     startDate: new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString().slice(0, 10),
     endDate: new Date().toISOString().slice(0, 10),
-    proximityLimit: 0.15,
-    obiCutoff: 0.65,
-    baseSize: 10.0,
+    roundBudget: 10.0,
     startBalance: 1000.0
   });
   const [backtestResults, setBacktestResults] = useState(null);
@@ -768,7 +766,7 @@ export default function App() {
                 <h1 className="text-base sm:text-lg font-bold tracking-widest text-[#F8FAFC]">
                   POLY-BOT <span className="text-[#10B981]">//</span> {activeTab === "live" ? "LIVE" : "SIM"}
                 </h1>
-                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.0.5</span>
+                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.0.6</span>
               </div>
               <span className="text-[9px] sm:text-[10px] uppercase font-mono tracking-wider text-slate-500">
                 Web3 Latency Arbitrage & Sweeper
@@ -1281,40 +1279,6 @@ export default function App() {
               </div>
 
               <div className="flex flex-col gap-1.5">
-                <div className="flex justify-between text-[10px] font-mono uppercase">
-                   <span className="text-slate-500">Vol Multiplier</span>
-                   <span className="text-slate-300 font-bold">{backtestParams.proximityLimit.toFixed(2)}x</span>
-                </div>
-                <input 
-                  type="range"
-                  min="0.05"
-                  max="0.50"
-                  step="0.01"
-                  value={backtestParams.proximityLimit}
-                  onChange={(e) => setBacktestParams(prev => ({ ...prev, proximityLimit: parseFloat(e.target.value) }))}
-                  disabled={backtesting}
-                  className="w-full accent-emerald-500 bg-slate-800"
-                />
-              </div>
-
-              <div className="flex flex-col gap-1.5">
-                <div className="flex justify-between text-[10px] font-mono uppercase">
-                  <span className="text-slate-500">OBI Cutoff</span>
-                  <span className="text-slate-300 font-bold">±{backtestParams.obiCutoff}</span>
-                </div>
-                <input 
-                  type="range"
-                  min="0.50"
-                  max="0.95"
-                  step="0.05"
-                  value={backtestParams.obiCutoff}
-                  onChange={(e) => setBacktestParams(prev => ({ ...prev, obiCutoff: parseFloat(e.target.value) }))}
-                  disabled={backtesting}
-                  className="w-full accent-emerald-500 bg-slate-800"
-                />
-              </div>
-
-              <div className="flex flex-col gap-1.5">
                 <label className="text-[10px] font-mono text-slate-500 uppercase">Starting Balance (USDC)</label>
                 <input 
                   type="number"
@@ -1327,12 +1291,12 @@ export default function App() {
               </div>
 
               <div className="flex flex-col gap-1.5">
-                <label className="text-[10px] font-mono text-slate-500 uppercase">Mock Position Size ($)</label>
+                <label className="text-[10px] font-mono text-slate-500 uppercase">Max Round Budget ($)</label>
                 <input 
                   type="number"
                   step="1"
-                  value={backtestParams.baseSize}
-                  onChange={(e) => setBacktestParams(prev => ({ ...prev, baseSize: parseFloat(e.target.value) || 0 }))}
+                  value={backtestParams.roundBudget}
+                  onChange={(e) => setBacktestParams(prev => ({ ...prev, roundBudget: parseFloat(e.target.value) || 0 }))}
                   disabled={backtesting}
                   className="bg-[#040407] border border-[#1E1E2F] rounded px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-emerald-500 w-full"
                 />
