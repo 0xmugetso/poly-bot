@@ -354,6 +354,98 @@ export default function App() {
     catch (e) { return null; }
   };
 
+  // Standalone Client-Side Live Stream (Fallback when disconnected from Python WS server)
+  useEffect(() => {
+    if (connected) return;
+
+    let isSubscribed = true;
+    const pythIds = [
+      "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+      "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+      "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+      "0xec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8"
+    ];
+
+    const clientSideLiveTick = async () => {
+      try {
+        // 1. Fetch live Pyth Hermes REST prices
+        const res = await fetch(`https://hermes.pyth.network/v2/updates/price/latest?` + pythIds.map(id => `ids[]=${id}`).join("&"));
+        if (res.ok) {
+          const pythData = await res.json();
+          const feedMap = {
+            [pythIds[0]]: "BTC",
+            [pythIds[1]]: "ETH",
+            [pythIds[2]]: "SOL",
+            [pythIds[3]]: "XRP"
+          };
+          
+          setSpotPrices(prev => {
+            const nextPrices = { ...prev };
+            (pythData.parsed || []).forEach(feed => {
+              const fid = feed.id.startsWith("0x") ? feed.id.toLowerCase() : `0x${feed.id.toLowerCase()}`;
+              const sym = feedMap[fid];
+              if (sym && feed.price) {
+                const rawPrice = parseFloat(feed.price.price);
+                const expo = parseInt(feed.price.expo);
+                const spot = rawPrice * Math.pow(10, expo);
+                if (spot > 0) nextPrices[sym] = spot;
+              }
+            });
+            return nextPrices;
+          });
+        }
+
+        // 2. Discover active 5M Polymarket markets via direct epoch slug targeting
+        const nowEpoch = Math.floor(Date.now() / 1000 / 300) * 300;
+        const syms = ["btc", "eth", "sol", "xrp"];
+        const fetchedMarkets = [];
+
+        await Promise.all(syms.map(async (sym) => {
+          const slug = `${sym}-updown-5m-${nowEpoch}`;
+          try {
+            const mRes = await fetch(`https://gamma-api.polymarket.com/markets?slug=${slug}`);
+            if (mRes.ok) {
+              const mData = await mRes.json();
+              if (Array.isArray(mData) && mData.length > 0) {
+                const m = mData[0];
+                const match = (m.question || "").match(/\$(\d+(?:\.\d+)?)/);
+                const strike = match ? parseFloat(match[1].replace(/,/g, "")) : 0.0;
+                let tokens = [];
+                try {
+                  tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : (m.clobTokenIds || []);
+                } catch(e) {}
+
+                fetchedMarkets.push({
+                  slug: slug,
+                  symbol: sym.toUpperCase(),
+                  strike_price: strike,
+                  epoch_start: nowEpoch,
+                  close_time: nowEpoch + 300,
+                  tokens: tokens,
+                  conditionId: m.conditionId,
+                  resolved: false,
+                  price_yes: 0.50,
+                  price_no: 0.50
+                });
+              }
+            }
+          } catch(e) {}
+        }));
+
+        if (isSubscribed && fetchedMarkets.length > 0) {
+          setActiveMarkets(fetchedMarkets);
+        }
+      } catch(e) {}
+    };
+
+    clientSideLiveTick();
+    const interval = setInterval(clientSideLiveTick, 1500);
+    return () => {
+      isSubscribed = false;
+      clearInterval(interval);
+    };
+  }, [connected]);
+
   // Clock synchronization loop
   useEffect(() => {
     const timer = setInterval(() => {
@@ -842,8 +934,8 @@ export default function App() {
                 className="flex items-center gap-1.5 text-xs font-mono text-slate-400 hover:text-slate-200 transition-colors border border-[#1E1E2F]/60 px-2 py-1 rounded bg-[#07070C]"
                 title="Configure Connection Settings"
               >
-                <Wifi size={14} className={connected ? "text-emerald-500 animate-pulse" : "text-rose-500"} />
-                <span className="uppercase text-[9px]">{connected ? 'WS Linked' : 'WS Lost'}</span>
+                <Wifi size={14} className={connected ? "text-emerald-500 animate-pulse" : "text-sky-400"} />
+                <span className="uppercase text-[9px]">{connected ? 'WS Linked' : 'Client Stream'}</span>
               </button>
             </div>
 
