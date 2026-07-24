@@ -468,7 +468,8 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "version": "2.1.5"
+            "proximity_threshold": "0.025%",
+            "version": "2.1.6"
         }
 
     async def broadcast(self):
@@ -921,12 +922,12 @@ class TradingEngine:
         time_delta = close_time - (time.time() + self.clob_clock_offset)
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-        # 1. Non-Toxic Certainty Gate (Proximity = |Spot - Strike| / Strike >= 0.05%)
+        # 1. Non-Toxic Certainty Gate (Proximity = |Spot - Strike| / Strike >= 0.025%)
         delta = spot - strike
         proximity = (abs(delta) / strike) if strike > 0 else 0.0
 
-        if proximity < 0.0005:
-            reason = f"TOXIC_SPOT_FLIP (Proximity {proximity*100:.4f}% < 0.05% threshold | Spot ${spot:.2f} vs Strike ${strike:.2f}, delta={delta:+.2f})"
+        if proximity < 0.00025:
+            reason = f"TOXIC_SPOT_FLIP (Proximity {proximity*100:.4f}% < 0.025% threshold | Spot ${spot:.2f} vs Strike ${strike:.2f}, delta={delta:+.2f})"
             self.add_system_log(f"[SWEEP_SKIPPED] {slug}: {reason}")
             tx_hash = f"0x{random.randbytes(16).hex()}"
             self.db.insert_trade(

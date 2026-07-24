@@ -325,7 +325,7 @@ class Backtester:
                 else:
                     if len(logs) < 200:
                         logs.append(
-                            f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: TOXIC_SPOT_FLIP (Spot hovering near strike, outcome certainty < 90%)."
+                            f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: TOXIC_SPOT_FLIP (Proximity < 0.025% threshold)."
                         )
                     equity_timeline.append({"time": total_rounds, "equity": equity})
                     continue

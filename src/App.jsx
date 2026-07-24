@@ -213,6 +213,7 @@ export default function App() {
   const [restingLimitOrders, setRestingLimitOrders] = useState([]);
   const [priorityGasGwei, setPriorityGasGwei] = useState(65);
   const [maticPrice, setMaticPrice] = useState(0.55);
+  const [proximityThreshold, setProximityThreshold] = useState("0.025%");
 
   // UI Controls
   const [connected, setConnected] = useState(false);
@@ -316,6 +317,7 @@ export default function App() {
       setPriorityGasGwei(data.priority_gas_gwei || 65);
       setMaticPrice(data.matic_price || 0.55);
       setClobClockOffset(data.clob_clock_offset || 0.0);
+      if (data.proximity_threshold) setProximityThreshold(data.proximity_threshold);
 
       // Manage log streams
       if (!isPausedStream) {
@@ -768,7 +770,7 @@ export default function App() {
                 <h1 className="text-base sm:text-lg font-bold tracking-widest text-[#F8FAFC]">
                   POLY-BOT <span className="text-[#10B981]">//</span> {activeTab === "live" ? "LIVE" : "SIM"}
                 </h1>
-                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.1.5</span>
+                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.1.6</span>
               </div>
               <span className="text-[9px] sm:text-[10px] uppercase font-mono tracking-wider text-slate-500">
                 Web3 Latency Arbitrage & Sweeper
@@ -1016,20 +1018,20 @@ export default function App() {
               <span className="text-[10px] text-slate-500 uppercase font-mono tracking-wider mb-1">State Engine Parameter Ledger</span>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-1.5 font-mono text-xs text-slate-400">
                 <div className="flex flex-col">
-                  <span className="text-[9px] text-slate-500 uppercase">Pricing Ladder</span>
-                  <span className="text-slate-200 font-bold">$0.01 / $0.02 / $0.03</span>
+                  <span className="text-[9px] text-slate-500 uppercase">Execution Mode</span>
+                  <span className="text-emerald-400 font-bold">Winning Side Sweeper</span>
                 </div>
                 <div className="flex flex-col">
-                  <span className="text-[9px] text-slate-500 uppercase">Budget Splitting</span>
-                  <span className="text-slate-200 font-bold">60% / 30% / 10%</span>
+                  <span className="text-[9px] text-slate-500 uppercase">Max Round Risk</span>
+                  <span className="text-slate-200 font-bold">5% Wallet ($10 Max)</span>
                 </div>
                 <div className="flex flex-col">
-                  <span className="text-[9px] text-slate-500 uppercase">Maker Mode</span>
-                  <span className="text-slate-200 font-bold">Two-Sided (Up & Down)</span>
+                  <span className="text-[9px] text-slate-500 uppercase">Execution Window</span>
+                  <span className="text-slate-200 font-bold">Sec 280-303 (T-20s..T+3s)</span>
                 </div>
                 <div className="flex flex-col">
-                  <span className="text-[9px] text-slate-500 uppercase">Boundary Window</span>
-                  <span className="text-slate-200 font-bold">Sec 295-299 & 0-5</span>
+                  <span className="text-[9px] text-slate-500 uppercase">Proximity Gate</span>
+                  <span className="text-emerald-400 font-bold">{proximityThreshold || "0.025%"}</span>
                 </div>
               </div>
             </div>
