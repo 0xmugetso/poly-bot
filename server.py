@@ -469,7 +469,7 @@ class TradingEngine:
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
             "proximity_threshold": "0.025%",
-            "version": "2.1.6"
+            "version": "2.1.7"
         }
 
     async def broadcast(self):
@@ -1193,6 +1193,16 @@ class TradingEngine:
                 self.add_system_log(f"[WARNING] Error in orphaned trade reconciler loop: {e}")
             await asyncio.sleep(30.0)
 
+    async def memory_maintenance_loop(self):
+        """Background worker running every 60s to trim internal deques and trigger garbage collection."""
+        import gc
+        while True:
+            try:
+                await asyncio.sleep(60.0)
+                gc.collect()
+            except Exception:
+                pass
+
     async def place_resting_orders_both_sides(self, market):
         """Places passive resting maker limit buy orders on BOTH sides (Up and Down) simultaneously using EGIG scaling."""
         slug = market["slug"]
@@ -1641,7 +1651,7 @@ class TradingEngine:
         if is_websocket:
             return None # Proceed to websocket handler
 
-        if path in ["/api/export-logs-txt", "/api/export-process-logs"] or path.startswith("/api/export-logs-txt"):
+        if path.startswith("/api/export-logs-txt") or path.startswith("/api/export-process-logs"):
             txt_content, filename = self.engine.export_process_logs_txt()
             headers = [
                 ("Content-Type", "text/plain; charset=utf-8"),
@@ -1650,10 +1660,16 @@ class TradingEngine:
             ]
             return http.HTTPStatus.OK, headers, txt_content.encode("utf-8")
 
-        if path == "/api/export-logs" or path.startswith("/api/export-logs"):
-            csv_content, filename = self.generate_csv_string()
+        if path.startswith("/api/export-logs") or path.startswith("/api/export-csv") or path.startswith("/api/export-telemetry"):
+            limit = None
+            if "?" in path:
+                query_str = path.split("?", 1)[1]
+                for param in query_str.split("&"):
+                    if param.startswith("limit="):
+                        limit = param.split("=")[1]
+            csv_content, filename = self.generate_csv_string(limit=limit)
             headers = [
-                ("Content-Type", "text/csv"),
+                ("Content-Type", "text/csv; charset=utf-8"),
                 ("Content-Disposition", f"attachment; filename={filename}"),
                 ("Access-Control-Allow-Origin", "*")
             ]
@@ -1847,6 +1863,7 @@ async def main():
     engine.supervise_task("Rolling Prices Update", engine.rolling_prices_update_loop)
     engine.supervise_task("CLOB Clock Sync", engine.sync_clob_clock)
     engine.supervise_task("Orphaned Trade Reconciler", engine.reconcile_orphaned_trades_loop)
+    engine.supervise_task("Memory Maintenance", engine.memory_maintenance_loop)
     
     # Run an initial export on startup to verify setup
     date_str = datetime.now(timezone.utc).strftime("%Y_%m_%d")

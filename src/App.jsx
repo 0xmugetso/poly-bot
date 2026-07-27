@@ -494,6 +494,27 @@ export default function App() {
   // Trigger manual CSV export of database trades via REST API or WebSocket fallback
   const handleExportCsv = async (limit = "all") => {
     setShowExportMenu(false);
+    
+    // Try relative API endpoint first
+    try {
+      const res = await fetch(`/api/export-logs?limit=${limit}`);
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        const timestamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "_").replace("T", "_");
+        const limitTag = limit && limit !== 'all' ? `_last_${limit}` : '_all';
+        link.download = `poly_bot_live_dump${limitTag}_${timestamp}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        addLocalSystemLog(`[EXPORT] Downloaded database CSV snapshot (${limit === 'all' ? 'All' : `Last ${limit}`} trades) via REST API.`);
+        return;
+      }
+    } catch (e) {}
+
+    // Fallback to explicit configured server URL
     try {
       const savedUrl = localStorage.getItem("custom_ws_url");
       const wsUrl = savedUrl || import.meta.env.VITE_WS_URL || "ws://localhost:8000";
@@ -515,9 +536,7 @@ export default function App() {
         addLocalSystemLog(`[EXPORT] Downloaded database CSV snapshot (${limit === 'all' ? 'All' : `Last ${limit}`} trades) via REST API.`);
         return;
       }
-    } catch (e) {
-      // Fallback to WebSocket if REST fetch fails or CORS occurs
-    }
+    } catch (e) {}
 
     if (ws.current && ws.current.readyState === WebSocket.OPEN) {
       ws.current.send(JSON.stringify({ action: "export_telemetry", limit }));
@@ -770,7 +789,7 @@ export default function App() {
                 <h1 className="text-base sm:text-lg font-bold tracking-widest text-[#F8FAFC]">
                   POLY-BOT <span className="text-[#10B981]">//</span> {activeTab === "live" ? "LIVE" : "SIM"}
                 </h1>
-                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.1.6</span>
+                <span className="text-[9px] font-mono text-slate-400/80 bg-[#12121A] border border-[#1E1E2F] px-1.5 py-0.5 rounded">v2.1.7</span>
               </div>
               <span className="text-[9px] sm:text-[10px] uppercase font-mono tracking-wider text-slate-500">
                 Web3 Latency Arbitrage & Sweeper

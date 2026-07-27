@@ -2,6 +2,7 @@ import time
 import json
 import random
 import os
+import shutil
 import urllib.request
 import ssl
 import re
@@ -199,7 +200,7 @@ class Backtester:
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 try:
                     with urllib.request.urlopen(req, timeout=15, context=ctx) as response, open(local_parquet, 'wb') as out_file:
-                        out_file.write(response.read())
+                        shutil.copyfileobj(response, out_file)
                 except Exception as e:
                     if len(logs) < 200:
                         logs.append(f"[WARNING] Pre-fetch failed for {hour_str}: {e}")
@@ -223,9 +224,9 @@ class Backtester:
         
         for hour_str in sorted_hours:
             current_mem = check_memory_usage_mb()
-            # Guard against memory leaks during simulation (> 2000 MB growth during simulation phase or total > 4000 MB)
-            if (current_mem - initial_sim_mem > 2000.0) or (current_mem > 4000.0):
-                logs.append(f"[MEMORY_SAFETY_LIMIT_REACHED] Simulation halted: memory growth ({current_mem - initial_sim_mem:.1f} MB) exceeded safety threshold.")
+            # Guard against memory limit on Railway Hobby plan (1 GB max)
+            if (current_mem - initial_sim_mem > 200.0) or (current_mem > 450.0):
+                logs.append(f"[MEMORY_SAFETY_LIMIT_REACHED] Simulation halted: process memory ({current_mem:.1f} MB) approaching Railway 1GB ceiling.")
                 break
 
             if time.time() - sim_start_time > 45.0:
@@ -394,6 +395,13 @@ class Backtester:
 
             del df
             gc.collect()
+
+        # Clean up parquet cache to keep RAM & container storage low
+        try:
+            if os.path.exists(cache_dir):
+                shutil.rmtree(cache_dir, ignore_errors=True)
+        except Exception:
+            pass
 
         gc.collect()
         net_profit = equity - self.start_balance
