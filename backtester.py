@@ -303,8 +303,8 @@ class Backtester:
                 up_won = (winner == "Up")
                 down_won = not up_won
                 
-                # Dynamic EGIG Hybrid Execution Window: Seconds 240 to 303 relative to epoch start (T-60s to T+3s)
-                window_start = epoch_start + 240
+                # Dynamic EGIG Hybrid Execution Window: Seconds 275 to 303 relative to epoch start (T-25s to T+3s)
+                window_start = epoch_start + 275
                 window_end = epoch_start + 303
                 
                 round_trades = df[
@@ -316,7 +316,8 @@ class Backtester:
                 p_yes = float(outcome_prices[0]) if len(outcome_prices) >= 2 else 0.50
                 p_no = float(outcome_prices[1]) if len(outcome_prices) >= 2 else 0.50
                 
-                # 1. Non-Toxic Certainty Gate Check
+                # 1. Non-Toxic Certainty Gate Check with Time-Scaled Threshold (T-25s..T-15s: 0.080%, T-14s..T-5s: 0.040%, T-4s..T+3s: 0.025%)
+                certainty_lead = max(p_yes, p_no)
                 if p_yes > 0.9:
                     winner = "Up"
                     winning_token = yes_token
@@ -326,7 +327,7 @@ class Backtester:
                 else:
                     if len(logs) < 200:
                         logs.append(
-                            f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: TOXIC_SPOT_FLIP (Proximity < 0.025% threshold)."
+                            f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: TOXIC_SPOT_FLIP (Spot hovering near strike, outcome lead < 90%)."
                         )
                     equity_timeline.append({"time": total_rounds, "equity": equity})
                     continue
@@ -379,7 +380,7 @@ class Backtester:
                 else:
                     if len(logs) < 200:
                         logs.append(
-                            f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: No cheap asks <= 3¢ on winning token ({winner}) during T-20s..T+3s window ($0.00 USDC cost change)."
+                            f"[EXPIRED_UNFILLED] Rd {total_rounds} {sym}: No cheap asks <= 3¢ on winning token ({winner}) during T-25s..T+3s window ($0.00 USDC cost change)."
                         )
                         
                 equity_timeline.append({"time": total_rounds, "equity": equity})

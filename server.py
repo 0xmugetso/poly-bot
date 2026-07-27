@@ -468,8 +468,8 @@ class TradingEngine:
             "priority_gas_gwei": self.priority_gas_gwei,
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
-            "proximity_threshold": "0.025%",
-            "version": "2.2.0"
+            "proximity_threshold": "Scaled 0.080%..0.025%",
+            "version": "2.2.1"
         }
 
     async def broadcast(self):
@@ -840,12 +840,24 @@ class TradingEngine:
             except Exception as e:
                 pass
 
+    def get_required_proximity(self, time_remaining):
+        """Time-scaled dynamic proximity gate: T-25s..T-15s (0.080%), T-14s..T-5s (0.040%), T-4s..T+3s (0.025%)."""
+        if time_remaining >= 15.0:
+            return 0.00080  # 0.080% (T-25s to T-15s)
+        elif time_remaining >= 5.0:
+            return 0.00040  # 0.040% (T-14s to T-5s)
+        else:
+            return 0.00025  # 0.025% (T-4s to T+3s)
+
     async def market_management_loop(self):
         """Main engine execution loop evaluating active 5M markets, expiration-window order placement, fills, and epoch turnover."""
         while True:
             await self.fetch_active_polymarket_events()
             t = time.time() + self.clob_clock_offset
             
+            # Active candidate markets for portfolio risk capping
+            candidate_markets = []
+
             for slug, market in list(self.active_markets.items()):
                 if market.get("resolved"):
                     continue
@@ -857,6 +869,8 @@ class TradingEngine:
                 
                 # Dynamic spot vs strike diff
                 delta = spot - strike
+                proximity = (abs(delta) / strike) if strike > 0 else 0.0
+                req_prox = self.get_required_proximity(time_remaining)
                 
                 # Simulated order book YES/NO pricing derived from spot vs strike delta
                 volatility_factor = 2.0 if symbol in ["BTC", "BNB"] else 0.1
@@ -870,12 +884,33 @@ class TradingEngine:
                 market["price_yes"] = round(price_yes, 2)
                 market["price_no"] = round(price_no, 2)
                 
-                # Dynamic EGIG Hybrid Sweeper Execution (T-60s down to T+3s)
-                if time_remaining <= 60.0 and time_remaining >= -3.0:
-                    last_sweep_t = market.get("last_sweep_t", 0.0)
-                    if t - last_sweep_t >= 2.0 and not market.get("swept_already"):
-                        market["last_sweep_t"] = t
-                        asyncio.create_task(self.evaluate_and_execute_egig_hybrid(market))
+                # 3. Mandatory Active Order Cancellation on Spot Flip or Unsafe Proximity (T-25s to T-0s)
+                if time_remaining <= 25.0 and time_remaining >= -3.0:
+                    current_outcome = "Up" if delta > 0 else "Down"
+                    last_outcome = market.get("last_outcome")
+                    spot_flipped = (last_outcome is not None and last_outcome != current_outcome)
+                    proximity_unsafe = (proximity < req_prox)
+
+                    if (spot_flipped or proximity_unsafe) and (market.get("posted_egig_ladder") or market.get("resting_bids_active")):
+                        market["posted_egig_ladder"] = False
+                        market["resting_bids_active"] = False
+                        # Cancel active resting limit orders for this slug
+                        for order in list(self.resting_limit_orders):
+                            if order.get("slug") == slug:
+                                self.resting_limit_orders.remove(order)
+                        
+                        log_reason = "Spot flipped direction" if spot_flipped else f"Proximity {proximity*100:.4f}% < req {req_prox*100:.3f}%"
+                        self.add_system_log(f"[EGIG_PURGE_CANCEL] Spot flipped or unsafe ({log_reason}). Canceled all resting bids for {slug}")
+
+                    market["last_outcome"] = current_outcome
+
+                    # Collect candidate if safe and in execution window (T-25s to T+3s)
+                    if proximity >= req_prox:
+                        candidate_markets.append({
+                            "market": market,
+                            "proximity": proximity,
+                            "slug": slug
+                        })
 
                 # EPOCH TURNOVER RESOLVER (Triggers immediately when time_remaining <= -3.0)
                 if time_remaining <= -3.0:
@@ -890,6 +925,35 @@ class TradingEngine:
                     if slug in self.market_locks:
                         self.market_locks.pop(slug)
             
+            # 4. Correlated Asset Risk Cap: Prioritize Top 2 Proximity Leads per Epoch
+            candidate_markets.sort(key=lambda x: x["proximity"], reverse=True)
+            active_epoch_slugs = set(
+                trade.get("slug") for trade in self.activity_log
+                if trade.get("status") in ["FILLED", "PENDING"] and (t - trade.get("timestamp_sec", t)) < 300
+            )
+
+            authorized_count = len(active_epoch_slugs)
+            for rank, item in enumerate(candidate_markets):
+                cand_m = item["market"]
+                c_slug = item["slug"]
+                c_prox = item["proximity"]
+                
+                if c_slug in active_epoch_slugs:
+                    # Already executed trade in this epoch
+                    continue
+                    
+                if authorized_count < 2:
+                    # Authorized for entry
+                    authorized_count += 1
+                    last_sweep_t = cand_m.get("last_sweep_t", 0.0)
+                    if t - last_sweep_t >= 2.0 and not cand_m.get("swept_already"):
+                        cand_m["last_sweep_t"] = t
+                        asyncio.create_task(self.evaluate_and_execute_egig_hybrid(cand_m))
+                else:
+                    if not cand_m.get("logged_portfolio_cap"):
+                        cand_m["logged_portfolio_cap"] = True
+                        self.add_system_log(f"[PORTFOLIO_CAP_SKIPPED] {c_slug}: Skipped entry due to 2-trade per epoch risk cap (Proximity {c_prox*100:.4f}% rank #{rank+1})")
+
             await self.broadcast()
             await asyncio.sleep(0.5)
 
@@ -921,21 +985,27 @@ class TradingEngine:
         tokens = market.get("tokens", [])
         spot = self.spot_prices.get(symbol, strike)
         close_time = float(market.get("close_time", time.time() + 300))
-        time_delta = close_time - (time.time() + self.clob_clock_offset)
+        time_remaining = close_time - (time.time() + self.clob_clock_offset)
+        time_delta = time_remaining
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-        # 1. Non-Toxic Certainty Gate (Proximity = |Spot - Strike| / Strike >= 0.025%)
+        # 1. Re-anchor Execution Window: T-25s to T+3s ONLY
+        if time_remaining > 25.0 or time_remaining < -3.0:
+            return
+
+        # 2. Time-scaled Dynamic Proximity Gate Check
         delta = spot - strike
         proximity = (abs(delta) / strike) if strike > 0 else 0.0
+        req_prox = self.get_required_proximity(time_remaining)
 
-        if proximity < 0.00025:
+        if proximity < req_prox:
             if not market.get("logged_toxic"):
                 market["logged_toxic"] = True
-                reason = f"TOXIC_SPOT_FLIP (Proximity {proximity*100:.4f}% < 0.025% threshold | Spot ${spot:.2f} vs Strike ${strike:.2f}, delta={delta:+.2f})"
+                reason = f"TOXIC_SPOT_FLIP (Proximity {proximity*100:.4f}% < {req_prox*100:.3f}% threshold at T{time_remaining:+.1f}s | Spot ${spot:.2f} vs Strike ${strike:.2f}, delta={delta:+.2f})"
                 self.add_system_log(f"[EGIG_SKIPPED] {slug}: {reason}")
             return
 
-        # 2. Establish GUARANTEED WINNING OUTCOME TOKEN ONLY
+        # 3. Establish GUARANTEED WINNING OUTCOME TOKEN ONLY
         winning_outcome = "Up" if delta > 0 else "Down"
         if len(tokens) >= 2:
             winning_token_id = tokens[0] if winning_outcome == "Up" else tokens[1]
@@ -946,12 +1016,13 @@ class TradingEngine:
 
         max_round_budget = min(10.0, max(1.0, 0.05 * self.wallet))
 
-        # 3. Post EGIG Tiered Maker Bids (T-60s to T-5s)
+        # 4. Post EGIG Tiered Maker Bids (T-25s to T-5s)
         if not market.get("posted_egig_ladder"):
             market["posted_egig_ladder"] = True
-            self.add_system_log(f"[EGIG_MAKER_LADDER] Posted 5-tier EGIG bids ($0.010..$0.030) on {slug} ({winning_outcome}) | Proximity {proximity*100:.4f}% safe")
+            market["resting_bids_active"] = True
+            self.add_system_log(f"[EGIG_MAKER_LADDER] Posted 5-tier EGIG bids ($0.010..$0.030) on {slug} ({winning_outcome}) | Proximity {proximity*100:.4f}% >= req {req_prox*100:.3f}%")
 
-        # 4. Continuous CLOB Ask Depth Sweep for Asks <= 3.0c
+        # 5. Continuous CLOB Ask Depth Sweep for Asks <= 3.0c
         asks = await self.fetch_clob_book_asks(winning_token_id)
         asks_below_3c = [a for a in asks if 0.0 < a["price"] <= 0.030]
 
@@ -998,6 +1069,7 @@ class TradingEngine:
                 reason=f"[EGIG_EXECUTED] Swept {total_acquired_shares:.2f} shares ({winning_outcome}) @ avg ${weighted_avg_price:.3f} (${total_cost_usdc:.2f} USDC cost)"
             )
             trade["strategy"] = "Strategy B (EGIG Hybrid Sweeper)"
+            trade["timestamp_sec"] = time.time()
 
             self.db.insert_trade(
                 tx_hash, now_utc, slug, "Strategy B (EGIG Hybrid Sweeper)", winning_outcome,
