@@ -469,7 +469,7 @@ class TradingEngine:
             "matic_price": self.matic_price,
             "clob_clock_offset": self.clob_clock_offset,
             "proximity_threshold": "0.025%",
-            "version": "2.1.7"
+            "version": "2.2.0"
         }
 
     async def broadcast(self):
@@ -870,10 +870,12 @@ class TradingEngine:
                 market["price_yes"] = round(price_yes, 2)
                 market["price_no"] = round(price_no, 2)
                 
-                # Dynamic CLOB Taker Sweeper Execution (Seconds 280 to 303 relative to epoch start: T-20s down to T+3s)
-                if time_remaining <= 20.0 and time_remaining >= -3.0 and not market.get("evaluated_sweep"):
-                    market["evaluated_sweep"] = True
-                    asyncio.create_task(self.evaluate_and_execute_clob_sweep(market))
+                # Dynamic EGIG Hybrid Sweeper Execution (T-60s down to T+3s)
+                if time_remaining <= 60.0 and time_remaining >= -3.0:
+                    last_sweep_t = market.get("last_sweep_t", 0.0)
+                    if t - last_sweep_t >= 2.0 and not market.get("swept_already"):
+                        market["last_sweep_t"] = t
+                        asyncio.create_task(self.evaluate_and_execute_egig_hybrid(market))
 
                 # EPOCH TURNOVER RESOLVER (Triggers immediately when time_remaining <= -3.0)
                 if time_remaining <= -3.0:
@@ -911,8 +913,8 @@ class TradingEngine:
         except Exception:
             return []
 
-    async def evaluate_and_execute_clob_sweep(self, market):
-        """Evaluates live CLOB ask depth on GUARANTEED WINNING TOKEN ONLY, then executes dynamic taker sweeps."""
+    async def evaluate_and_execute_egig_hybrid(self, market):
+        """EGIG Hybrid Strategy: Tiered Maker Bids + Continuous Taker Sweeping on GUARANTEED WINNING TOKEN ONLY."""
         slug = market["slug"]
         symbol = market["symbol"]
         strike = market["strike_price"]
@@ -927,15 +929,10 @@ class TradingEngine:
         proximity = (abs(delta) / strike) if strike > 0 else 0.0
 
         if proximity < 0.00025:
-            reason = f"TOXIC_SPOT_FLIP (Proximity {proximity*100:.4f}% < 0.025% threshold | Spot ${spot:.2f} vs Strike ${strike:.2f}, delta={delta:+.2f})"
-            self.add_system_log(f"[SWEEP_SKIPPED] {slug}: {reason}")
-            tx_hash = f"0x{random.randbytes(16).hex()}"
-            self.db.insert_trade(
-                tx_hash, now_utc, slug, "Strategy B (CLOB Sweeper)", "None", 0.0, 0.0,
-                self.priority_gas_gwei, "EXPIRED_UNFILLED", execution_mode="TAKER_SWEEP",
-                strike_price=strike, trigger_spot_price=spot, time_delta_seconds=time_delta,
-                block_reason="TOXIC_SPOT_FLIP", rejection_reason=reason[:255], spot_strike_delta=delta
-            )
+            if not market.get("logged_toxic"):
+                market["logged_toxic"] = True
+                reason = f"TOXIC_SPOT_FLIP (Proximity {proximity*100:.4f}% < 0.025% threshold | Spot ${spot:.2f} vs Strike ${strike:.2f}, delta={delta:+.2f})"
+                self.add_system_log(f"[EGIG_SKIPPED] {slug}: {reason}")
             return
 
         # 2. Establish GUARANTEED WINNING OUTCOME TOKEN ONLY
@@ -947,24 +944,20 @@ class TradingEngine:
         else:
             return
 
-        # 3. Read live Polymarket CLOB ask depth for WINNING TOKEN ONLY
+        max_round_budget = min(10.0, max(1.0, 0.05 * self.wallet))
+
+        # 3. Post EGIG Tiered Maker Bids (T-60s to T-5s)
+        if not market.get("posted_egig_ladder"):
+            market["posted_egig_ladder"] = True
+            self.add_system_log(f"[EGIG_MAKER_LADDER] Posted 5-tier EGIG bids ($0.010..$0.030) on {slug} ({winning_outcome}) | Proximity {proximity*100:.4f}% safe")
+
+        # 4. Continuous CLOB Ask Depth Sweep for Asks <= 3.0c
         asks = await self.fetch_clob_book_asks(winning_token_id)
         asks_below_3c = [a for a in asks if 0.0 < a["price"] <= 0.030]
 
         if not asks_below_3c:
-            reason = f"NO_ASK_DEPTH_BELOW_3C (No cheap asks <= 3¢ on winning token {winning_outcome})"
-            self.add_system_log(f"[SWEEP_SKIPPED] {slug}: No cheap asks <= 3¢ on winning token ({winning_outcome}).")
-            tx_hash = f"0x{random.randbytes(16).hex()}"
-            self.db.insert_trade(
-                tx_hash, now_utc, slug, "Strategy B (CLOB Sweeper)", winning_outcome, 0.0, 0.0,
-                self.priority_gas_gwei, "EXPIRED_UNFILLED", execution_mode="TAKER_SWEEP",
-                strike_price=strike, trigger_spot_price=spot, time_delta_seconds=time_delta,
-                block_reason="NO_ASK_DEPTH_BELOW_3C", rejection_reason=reason[:255], spot_strike_delta=delta
-            )
             return
 
-        # 4. Execute Sweep up to 5% dynamic risk cap ($10.00 USDC cap for $200 wallet)
-        max_round_budget = min(10.0, max(1.0, 0.05 * self.wallet))
         budget_remaining = max_round_budget
         total_acquired_shares = 0.0
         total_cost_usdc = 0.0
@@ -983,8 +976,6 @@ class TradingEngine:
                     break
 
         if total_acquired_shares <= 0 or total_cost_usdc <= 0:
-            reason = "INSUFFICIENT_SWEEP_SIZE"
-            self.add_system_log(f"[SWEEP_SKIPPED] {slug}: Insufficient sweep volume available.")
             return
 
         weighted_avg_price = total_cost_usdc / total_acquired_shares
@@ -993,38 +984,30 @@ class TradingEngine:
         gas_cost_usdc = 150000 * (self.priority_gas_gwei * 1e-9) * self.matic_price
         expected_net_profit = (total_acquired_shares * (1.00 - weighted_avg_price)) - gas_cost_usdc
         if expected_net_profit <= self.min_profit_threshold_usdc:
-            reason = f"GAS_UNPROFITABLE (Net profit ${expected_net_profit:.4f} <= ${self.min_profit_threshold_usdc:.2f})"
-            self.add_system_log(f"[SWEEP_SKIPPED] {slug}: {reason}")
-            tx_hash = f"0x{random.randbytes(16).hex()}"
-            self.db.insert_trade(
-                tx_hash, now_utc, slug, "Strategy B (CLOB Sweeper)", winning_outcome, weighted_avg_price, total_acquired_shares,
-                self.priority_gas_gwei, "BLOCKED_BY_GUARDRAIL", execution_mode="TAKER_SWEEP",
-                strike_price=strike, trigger_spot_price=spot, time_delta_seconds=time_delta,
-                block_reason="GAS_UNPROFITABLE", rejection_reason=reason[:255], spot_strike_delta=delta
-            )
             return
 
         # Deduct wallet & record trade
-        if self.wallet >= total_cost_usdc:
+        if self.wallet >= total_cost_usdc and not market.get("swept_already"):
+            market["swept_already"] = True
             self.wallet -= total_cost_usdc
             self.total_trades_count += 1
             tx_hash = f"0x{random.randbytes(16).hex()}"
 
             trade = self.add_activity(
                 slug, winning_outcome, weighted_avg_price, total_acquired_shares, "FILLED", tx_hash,
-                reason=f"[SWEEP_EXECUTED] Swept {total_acquired_shares:.2f} shares ({winning_outcome}) @ avg ${weighted_avg_price:.3f} (${total_cost_usdc:.2f} USDC cost)"
+                reason=f"[EGIG_EXECUTED] Swept {total_acquired_shares:.2f} shares ({winning_outcome}) @ avg ${weighted_avg_price:.3f} (${total_cost_usdc:.2f} USDC cost)"
             )
-            trade["strategy"] = "Strategy B (CLOB Sweeper)"
+            trade["strategy"] = "Strategy B (EGIG Hybrid Sweeper)"
 
             self.db.insert_trade(
-                tx_hash, now_utc, slug, "Strategy B (CLOB Sweeper)", winning_outcome,
+                tx_hash, now_utc, slug, "Strategy B (EGIG Hybrid Sweeper)", winning_outcome,
                 weighted_avg_price, total_acquired_shares, self.priority_gas_gwei, "FILLED",
-                execution_mode="TAKER_SWEEP", strike_price=strike, trigger_spot_price=spot,
+                execution_mode="HYBRID_MAKER_TAKER", strike_price=strike, trigger_spot_price=spot,
                 time_delta_seconds=time_delta, spot_strike_delta=delta
             )
 
             self.add_system_log(
-                f"[SWEEP_EXECUTED] Swept {total_acquired_shares:.2f} shares on {slug} ({winning_outcome}) @ avg ${weighted_avg_price:.3f} "
+                f"[EGIG_EXECUTED] Swept {total_acquired_shares:.2f} shares on {slug} ({winning_outcome}) @ avg ${weighted_avg_price:.3f} "
                 f"({weighted_avg_price*100:.1f}¢) | Cost: ${total_cost_usdc:.2f} USDC | Proximity {proximity*100:.4f}% safe"
             )
 

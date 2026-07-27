@@ -303,8 +303,8 @@ class Backtester:
                 up_won = (winner == "Up")
                 down_won = not up_won
                 
-                # Dynamic Execution Window: Seconds 280 to 303 relative to epoch start (T-20s to T+3s)
-                window_start = epoch_start + 280
+                # Dynamic EGIG Hybrid Execution Window: Seconds 240 to 303 relative to epoch start (T-60s to T+3s)
+                window_start = epoch_start + 240
                 window_end = epoch_start + 303
                 
                 round_trades = df[
